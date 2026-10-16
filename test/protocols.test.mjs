@@ -189,11 +189,11 @@ test("root endpoint paths work and protocol options fail fast when invalid", asy
   await assert.rejects(plugin.auth.loader(async () => account({ protocol: "unknown" })))
 })
 
-test("a Base URL is the only extra login prompt; both example sites work without protocol settings", async (t) => {
+test("a Base URL is the only extra login prompt; HTTP and HTTPS work without protocol settings", async (t) => {
   catalog(t, ["claude-test", "gpt-test", "deepseek-chat", "gemini-test"])
   const plugin = await Sub2apiPlugin()
   assert.deepEqual(plugin.auth.methods[0].prompts.map((p) => p.key), ["baseURL"])
-  for (const baseURL of ["http://179.255.97.172:3005", "https://api.pingcodes.cc"]) {
+  for (const baseURL of ["http://127.0.0.1:3005", "https://api.example.com"]) {
     const auth = account({ baseURL })
     const loader = await plugin.auth.loader(async () => auth)
     assert.equal(loader.baseURL, baseURL + "/v1")
@@ -204,7 +204,7 @@ test("a Base URL is the only extra login prompt; both example sites work without
 })
 
 test("a single baseUrl option removes all extra prompts without retargeting saved accounts", async () => {
-  const baseURL = "https://api.pingcodes.cc"
+  const baseURL = "https://api.example.com"
   for (const key of ["baseUrl", "baseURL", "url"]) {
     const plugin = await Sub2apiPlugin({}, { [key]: baseURL })
     assert.deepEqual(plugin.auth.methods[0].prompts, [])
@@ -215,14 +215,14 @@ test("a single baseUrl option removes all extra prompts without retargeting save
   }
   const site = await Sub2apiSite1({}, { sites: [{ baseUrl: baseURL }] })
   assert.deepEqual(site.auth.methods[0].prompts, [])
-  assert.equal(site.provider.id, "api-pingcodes-cc")
+  assert.equal(site.provider.id, "api-example-com")
   for (const baseUrl of ["", "ftp://invalid.example.com", baseURL + "?key=secret"]) {
     await assert.rejects(Sub2apiPlugin({}, { baseUrl }))
   }
 })
 
 test("advanced headers work with only baseUrl configured and add no login prompts", async (t) => {
-  const baseUrl = "https://api.pingcodes.cc"
+  const baseUrl = "https://api.example.com"
   const plugin = await Sub2apiPlugin({}, { baseUrl, headers: { "User-Agent": "my-client", "X-Client": "magpie" } })
   const auth = { type: "api", key: "sk-test-advanced-headers" }
   assert.deepEqual(plugin.auth.methods[0].prompts, [])

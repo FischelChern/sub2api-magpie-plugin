@@ -40,8 +40,7 @@ magpie plugin login sub2api
 普通使用只需要配置站点 **Base URL**，例如：
 
 ```text
-http://179.255.97.172:3005
-https://api.pingcodes.cc
+https://api.example.com
 ```
 
 不需要手动添加 `/v1`、选择厂商/协议、填写账号名或额外请求头。插件自动补齐接口路径、发现模型，并按模型名称选择协议；账号默认使用站点域名和 key 的后四位命名。
@@ -51,7 +50,7 @@ https://api.pingcodes.cc
 也可以直接在插件选项里只填一个 `baseUrl`：
 
 ```json
-{"baseUrl":"https://api.pingcodes.cc"}
+{"baseUrl":"https://api.example.com"}
 ```
 
 这样登录时连站点地址也无需再次填写，只输入 API key 即可。`baseUrl`、`baseURL`、`url` 都支持（同时存在时优先 `url`，其次 `baseURL`）。这只是没有保存站点地址的账号的默认地址，不会覆盖已有账号保存的站点。HTTP 和 HTTPS、IP 加端口、部署路径前缀均支持。
@@ -75,7 +74,7 @@ https://api.pingcodes.cc
 
 ```json
 {
-  "baseUrl": "https://api.pingcodes.cc",
+  "baseUrl": "https://api.example.com",
   "headers": {
     "User-Agent": "my-client",
     "X-Client": "magpie"
