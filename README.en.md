@@ -49,6 +49,19 @@ The same JSON can be entered in Magpie's plugin options editor. A site provider 
 
 Header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The final merged headers are enforced in the account's fetch function, so callers cannot override them. Values are literal; environment expansion and templates are not supported.
 
+Inference automatically sets a protocol-specific compatibility `User-Agent` (not the SDK version installed by the host):
+
+| API protocol | Default `User-Agent` |
+| --- | --- |
+| `responses` (default for GPT / Codex) | `codex_cli_rs/0.146.0 (magpie-sub2api)` |
+| `chat-completions` | `OpenAI/JS (magpie-sub2api)` |
+| `anthropic` | `anthropic-typescript (magpie-sub2api)` |
+| `gemini` | `google-genai-sdk (magpie-sub2api)` |
+
+Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Precedence is **caller headers < protocol defaults < global headers < site headers < account headers**, case-insensitively. An explicit `User-Agent`, including an empty string, overrides the automatic value; remove any old override to enable automatic selection. Usage, model discovery and Codex reasoning-level queries do not receive these defaults and keep their existing custom headers.
+
+These identifiers provide protocol compatibility; they do not make Magpie an official client or change account permissions. If `This account only allows Codex official clients` persists, the site may also validate request bodies or other client characteristics. Ask the administrator to allow compatible clients for the account, or use a supported official client.
+
 Headers must be a JSON object with string values and valid names. Line breaks, NUL, authentication headers and transport-managed headers are rejected. Use the account API key rather than setting `Authorization`, `X-API-Key` or `X-Goog-API-Key`. Reserved transport headers include `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Upgrade`, `Keep-Alive`, `TE`, `Trailer`, proxy authorization/connection headers and `Accept-Encoding`. Validation errors do not include header values.
 
 Inference is restricted to the account's origin and configured protocol paths, including its deployment prefix. Redirects are rejected on all requests to avoid leaking credentials or custom headers; configure the final API URL instead. Site URLs cannot contain credentials, query strings or fragments. HTTP is allowed for local development; use HTTPS in production. Do not commit secrets or put them in shell history.

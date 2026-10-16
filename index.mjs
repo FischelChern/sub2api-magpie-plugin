@@ -29,6 +29,13 @@ const RESPONSES = "@ai-sdk/openai"
 const GEMINI = "@ai-sdk/google"
 const PROTOCOLS = { anthropic: MESSAGES, responses: RESPONSES, "chat-completions": CHAT, gemini: GEMINI }
 const DEFAULT_PATHS = { anthropic: "/v1", responses: "/v1", "chat-completions": "/v1", gemini: "/v1beta" }
+// Compatibility identifiers, not the SDK versions installed by the host.
+const PROTOCOL_USER_AGENTS = {
+  anthropic: "anthropic-typescript (magpie-sub2api)",
+  responses: "codex_cli_rs/0.146.0 (magpie-sub2api)",
+  "chat-completions": "OpenAI/JS (magpie-sub2api)",
+  gemini: "google-genai-sdk (magpie-sub2api)",
+}
 const TIMEOUT = 15_000
 
 const HOUR = 3600
@@ -162,6 +169,8 @@ function accountFetch(base, key, extra, routing) {
     if (protocol === "gemini") target.searchParams.delete("key")
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
+    // Replace generic host/SDK identity, but keep explicit account configuration.
+    if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
     for (const [name, value] of Object.entries(extra)) headers.set(name, value)
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)

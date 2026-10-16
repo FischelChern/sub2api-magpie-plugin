@@ -120,6 +120,92 @@ test("inference enforces configured headers and the selected key for all three A
   }
 })
 
+test("inference selects user agents by endpoint including rewritten paths and Request inputs", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
+  const loader = await plugin.auth.loader(async () => auth({ baseURL: BASE + "/prefix" }))
+  const calls = []
+  const response = json({})
+  t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return response })
+  for (const [path, userAgent] of [
+    ["/v1/responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
+    ["/openai/v1/responses/compact", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
+    ["/v1/chat/completions", "OpenAI/JS (magpie-sub2api)"],
+    ["/v1/messages", "anthropic-typescript (magpie-sub2api)"],
+    ["/v1beta/models/gemini-test:streamGenerateContent", "google-genai-sdk (magpie-sub2api)"],
+    ["/v1/responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
+  ]) {
+    for (const kind of ["string", "URL", "Request"]) {
+      const url = BASE + "/prefix" + path
+      const input = kind === "Request" ? new Request(url, { headers: { "User-Agent": "request-client" } })
+        : kind === "URL" ? new URL(url) : url
+      assert.equal(await loader.fetch(input, { headers: { "USER-AGENT": "host-sdk" } }), response)
+      const call = calls.at(-1)
+      assert.equal(call.init.headers.get("user-agent"), userAgent)
+      assert.equal(call.init.headers.get("authorization"), `Bearer ${auth().key}`)
+      assert.equal(call.init.redirect, "error")
+      if (path === "/v1/responses") {
+        assert.equal(call.input instanceof Request ? call.input.url : String(call.input), BASE + "/prefix/openai/v1/responses")
+      }
+    }
+  }
+  await loader.fetch(BASE + "/prefix/v1/responses")
+  assert.equal(calls.at(-1).init.headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
+  const count = calls.length
+  await assert.rejects(loader.fetch("https://other.example.com/prefix/v1/responses"), /Refusing/)
+  assert.equal(calls.length, count)
+})
+
+test("explicit user agents override protocol defaults with isolated global site and account precedence", async (t) => {
+  const options = {
+    headers: { "USER-AGENT": "global" },
+    sites: [{ id: "work", url: BASE, headers: { "User-Agent": "site" } }],
+  }
+  const pooled = await plugins.Sub2apiPlugin({}, options)
+  const site = await plugins.Sub2apiSite1({}, options)
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  const accountLoader = await site.auth.loader(async () => auth({ headers: '{"uSeR-aGeNt":"account"}' }, "sk-account"))
+  for (const [plugin, metadata, expected] of [
+    [pooled, {}, "global"], [site, {}, "site"], [site, { headers: { "user-agent": "" } }, ""],
+  ]) {
+    const loader = await plugin.auth.loader(async () => auth(metadata, "sk-other"))
+    for (const path of ["responses", "messages", "chat/completions", "models/gemini-test:generateContent"]) {
+      await accountLoader.fetch(BASE + "/v1/" + path)
+      await loader.fetch(BASE + "/v1/" + path, { headers: { "user-agent": "caller" } })
+      await accountLoader.fetch(BASE + "/v1/" + path)
+      assert.deepEqual(calls.slice(-3).map((h) => h.get("user-agent")), ["account", expected, "account"])
+      assert.deepEqual(calls.slice(-3).map((h) => h.get("authorization")), ["Bearer sk-account", "Bearer sk-other", "Bearer sk-account"])
+    }
+  }
+})
+
+test("protocol user agents do not affect management or unrecognized endpoints", async (t) => {
+  const calls = mockAPI(t)
+  const plugin = await plugins.Sub2apiPlugin()
+  const account = auth()
+  await plugin.auth.usage(async () => account)
+  await plugin.provider.models({ models: {} }, { auth: account })
+  assert.equal(calls.length, 3)
+  for (const call of calls) assert.equal(new Headers(call.headers).has("user-agent"), false)
+  const loader = await plugin.auth.loader(async () => account)
+  await loader.fetch(BASE + "/v1/models", { headers: { "User-Agent": "caller" } })
+  assert.equal(new Headers(calls.at(-1).headers).get("user-agent"), "caller")
+})
+
+test("inference preserves a forbidden response without retrying or changing its body", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const body = { error: { message: "This account only allows Codex official clients", type: "forbidden_error" } }
+  const response = json(body, 403)
+  let calls = 0
+  t.mock.method(globalThis, "fetch", async () => { calls++; return response })
+  const actual = await loader.fetch(BASE + "/v1/responses")
+  assert.equal(actual, response)
+  assert.equal(actual.status, 403)
+  assert.deepEqual(await actual.json(), body)
+  assert.equal(calls, 1)
+})
+
 test("inference supports Request and URL inputs, including header overrides", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => auth({ headers: { "X-Account": "yes" } }))

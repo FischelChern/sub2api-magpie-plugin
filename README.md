@@ -110,6 +110,21 @@ magpie plugin login backup
 - 账号请求头保存在 Magpie 认证元数据 `metadata.headers` 中，可为对象或 JSON 对象字符串；修改后需让 Magpie 重新加载账号。
 - 不做环境变量展开或模板替换，值按字面发送。敏感值不要提交到代码仓库，也不要直接写入会记录历史的终端命令。
 
+### 自动 User-Agent
+
+实际模型请求按 API 协议自动设置以下兼容标识（不是宿主实际安装的 SDK 版本），无需额外配置：
+
+| API 协议 | 默认 `User-Agent` |
+| --- | --- |
+| `responses`（GPT / Codex 默认） | `codex_cli_rs/0.146.0 (magpie-sub2api)` |
+| `chat-completions` | `OpenAI/JS (magpie-sub2api)` |
+| `anthropic` | `anthropic-typescript (magpie-sub2api)` |
+| `gemini` | `google-genai-sdk (magpie-sub2api)` |
+
+选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。优先级为 **调用方请求头 < 协议默认值 < 全局 headers < 站点 headers < 账号 headers**，同名头不区分大小写。显式配置的 `User-Agent`（包括空字符串）会覆盖自动值；若已有旧配置，请删除它以启用自动选择。用量、模型列表和 Codex 思考等级查询不添加这些默认标识，仍使用原有的自定义请求头。
+
+这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。如果仍返回 `This account only allows Codex official clients`，站点可能还校验请求体或其他客户端特征；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
+
 ### 校验和安全边界
 
 请求头必须是名称合法、值为字符串的 JSON 对象；拒绝换行、NUL，以及认证和连接管理保留头。`Authorization`、`X-API-Key`、`X-Goog-API-Key` 等不允许在额外请求头中设置，请使用账号的 API key。`Host`、`Content-Length`、`Connection`、`Transfer-Encoding`、`Upgrade`、`Keep-Alive`、`TE`、`Trailer`、代理认证/连接头及 `Accept-Encoding` 也由客户端管理。
