@@ -1,0 +1,38 @@
+{
+  "protocol": "auto",
+  "headers": {
+    "X-Client": "magpie-sub2api"
+  },
+  "sites": [
+    {
+      "id": "anthropic-site",
+      "name": "Anthropic",
+      "baseURL": "https://api.example.com",
+      "protocol": "anthropic"
+    },
+    {
+      "id": "openai-site",
+      "name": "OpenAI",
+      "baseURL": "https://api.example.com",
+      "protocol": "responses"
+    },
+    {
+      "id": "domestic-site",
+      "name": "Domestic Models",
+      "baseURL": "https://api.example.com",
+      "protocol": "chat-completions"
+    },
+    {
+      "id": "mixed-site",
+      "name": "Other / Mixed Models",
+      "baseURL": "https://api.example.com",
+      "protocol": "auto",
+      "modelProtocols": {
+        "my-claude-alias": "anthropic",
+        "my-gpt-alias": "responses",
+        "my-gemini-alias": "gemini",
+        "my-domestic-alias": "chat-completions"
+      }
+    }
+  ]
+}
