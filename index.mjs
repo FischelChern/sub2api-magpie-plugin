@@ -37,6 +37,9 @@ const PROTOCOL_USER_AGENTS = {
   gemini: "google-genai-sdk (magpie-sub2api)",
 }
 const TIMEOUT = 15_000
+const ICON_TIMEOUT = 3_000
+const ICON_MAX = 1 << 20
+const ICON_PAGE_MAX = 512 << 10
 
 const HOUR = 3600
 const DAY = 24 * HOUR
@@ -189,6 +192,106 @@ function hostOf(base) {
   } catch {
     return base
   }
+}
+
+// Icon discovery is public and separate from authenticated API requests.
+// Only the configured origin is contacted, never redirects or third-party CDNs.
+async function iconBytes(url, accept, limit, signal) {
+  const res = await fetch(url, {
+    headers: { accept },
+    credentials: "omit",
+    redirect: "error",
+    signal,
+  })
+  if (!res.ok || Number(res.headers.get("content-length")) > limit) {
+    await res.body?.cancel()
+    throw new Error("Icon response unavailable or too large")
+  }
+  if (!res.body) return Buffer.alloc(0)
+  const reader = res.body.getReader()
+  const chunks = []
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > limit) throw new Error("Icon response too large")
+      chunks.push(Buffer.from(value))
+    }
+    return Buffer.concat(chunks, size)
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+}
+
+function iconData(bytes) {
+  if (!bytes.length || bytes.length > ICON_MAX) return ""
+  const hex = bytes.subarray(0, 12).toString("hex")
+  const type = hex.startsWith("89504e470d0a1a0a") ? "png"
+    : hex.startsWith("ffd8ff") ? "jpeg"
+    : /^474946383[79]61/.test(hex) ? "gif"
+    : hex.startsWith("52494646") && hex.slice(16) === "57454250" ? "webp"
+    : /^00000[12]00/.test(hex) ? "x-icon"
+    : /^(?:<\?xml[\s\S]*?\?>\s*|<!--[\s\S]*?-->\s*)*<svg(?:\s|\/?>)/i.test(bytes.toString("utf8").trim()) ? "svg+xml" : ""
+  return type ? `data:image/${type};base64,${bytes.toString("base64")}` : ""
+}
+
+function htmlValue(value) {
+  return value.replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt);/gi, (all, entity) => {
+    const named = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">" }
+    const name = entity.toLowerCase()
+    if (named[name]) return named[name]
+    const code = name.startsWith("#x") ? parseInt(name.slice(2), 16) : Number(name.slice(1))
+    return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : all
+  })
+}
+
+async function siteIcon(base) {
+  const home = new URL(base + "/")
+  const signal = AbortSignal.timeout(ICON_TIMEOUT)
+  const candidates = []
+  try {
+    const bytes = await iconBytes(home, "text/html", ICON_PAGE_MAX, signal)
+    const head = bytes.toString("utf8")
+      .replace(/<!--[\s\S]*?-->|<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+      .split(/<\/head\s*>|<body\b/i)[0]
+    for (const [tag] of head.matchAll(/<link\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi)) {
+      const attrs = Object.create(null)
+      for (const [, name, double, single, bare] of tag.matchAll(/([^\s=<>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+        attrs[name.toLowerCase()] = htmlValue(double ?? single ?? bare)
+      }
+      const rel = (attrs.rel ?? "").toLowerCase().split(/\s+/)
+      if (rel.some((value) => ["icon", "apple-touch-icon", "apple-touch-icon-precomposed"].includes(value)) && attrs.href) {
+        candidates.push(attrs.href)
+      }
+    }
+  } catch {}
+  candidates.push(new URL("favicon.ico", home).href, new URL("/favicon.ico", home).href)
+  const seen = new Set()
+  // Bound both request count and total time on pages with many icon links.
+  for (const candidate of candidates.slice(0, 8).concat(candidates.slice(-2))) {
+    if (signal.aborted) break
+    try {
+      if (/^data:image\//i.test(candidate)) {
+        if (candidate.length > ICON_MAX * 1.5) continue
+        const match = /^data:image\/[^;,]+(;base64)?,([\s\S]*)$/i.exec(candidate)
+        if (!match) continue
+        const data = iconData(match[1] ? Buffer.from(match[2], "base64") : Buffer.from(decodeURIComponent(match[2])))
+        if (data) return data
+        continue
+      }
+      const url = new URL(candidate, home)
+      if (url.origin !== home.origin || url.username || url.password || !["http:", "https:"].includes(url.protocol)) continue
+      url.hash = ""
+      if (seen.has(url.href)) continue
+      seen.add(url.href)
+      const data = iconData(await iconBytes(url, "image/*", ICON_MAX, signal))
+      if (data) return data
+    } catch {}
+  }
+  return ""
 }
 
 // label is how magpie names the account: the name given at sign-in, else
@@ -485,40 +588,63 @@ function hooks(client, id, site, options) {
           validate: checkURL,
         },
       ]
-  return {
-    auth: {
-      provider: id,
-      // each account's own site: the loader runs once per account
-      async loader(getAuth) {
-        const auth = await getAuth()
-        if (auth?.type !== "api" || !auth.key) return {}
-        const base = baseOf(auth)
-        if (!base) return {}
-        await named(client, id, auth, base)
-        // Bearer for chat and responses, x-api-key for messages: the
-        // gateway takes either
-        const headers = headersOf(auth)
-        const routing = routingFor(auth)
-        return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing) }
-      },
-      methods: [
-        {
-          type: "api",
-          label: site ? `${site.name} API key` : "sub2api API key",
-          placeholder: "sk-…",
-          prompts,
-        },
-      ],
-      // magpie's: the plan and how much of it is used
-      async usage(getAuth) {
-        const auth = await getAuth()
-        try {
-          return await usage(client, id, auth, baseOf(auth), headersOf(auth))
-        } catch (e) {
-          return { error: e.message, windows: [] }
-        }
-      },
+  let iconBase = site?.base ?? root(defaultURL)
+  let accountIconSelected = false
+  const icons = new Map()
+  const refreshIcon = async (base, account = false) => {
+    if (account && !site && !accountIconSelected) {
+      accountIconSelected = true
+      if (iconBase !== base) delete authHook.icon
+      iconBase = base
+    }
+    if (!base || base !== iconBase) return
+    let cached = icons.get(base)
+    if (!cached || cached.expires <= Date.now()) {
+      cached = { expires: Infinity }
+      cached.pending = siteIcon(base).catch(() => "").then((icon) => {
+        cached.expires = Date.now() + (icon ? HOUR : 5 * 60) * 1000
+        return icon
+      })
+      icons.set(base, cached)
+    }
+    const icon = await cached.pending
+    if (icon && base === iconBase) authHook.icon = icon
+  }
+  const authHook = {
+    provider: id,
+    // each account's own site: the loader runs once per account
+    async loader(getAuth) {
+      const auth = await getAuth()
+      if (auth?.type !== "api" || !auth.key) return {}
+      const base = baseOf(auth)
+      if (!base) return {}
+      await named(client, id, auth, base)
+      // Bearer for chat and responses, x-api-key for messages: the
+      // gateway takes either
+      const headers = headersOf(auth)
+      const routing = routingFor(auth)
+      return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing) }
     },
+    methods: [
+      {
+        type: "api",
+        label: site ? `${site.name} API key` : "sub2api API key",
+        placeholder: "sk-…",
+        prompts,
+      },
+    ],
+    // magpie's: the plan and how much of it is used
+    async usage(getAuth) {
+      const auth = await getAuth()
+      try {
+        return await usage(client, id, auth, baseOf(auth), headersOf(auth))
+      } catch (e) {
+        return { error: e.message, windows: [] }
+      }
+    },
+  }
+  return {
+    auth: authHook,
     // the key's group's list, asked of the account's site
     provider: {
       id,
@@ -527,25 +653,26 @@ function hooks(client, id, site, options) {
         const base = baseOf(auth)
         if (!base) return provider.models
         const routing = routingFor(auth)
+        const icon = refreshIcon(base, true)
         try {
           return await models(id, base, auth, provider?.models, headersOf(auth), routing)
         } catch (e) {
           if (e?.signIn) throw e
           return provider.models
+        } finally {
+          await icon
         }
       },
     },
-    // a site's provider is shown by the name it was given (one the user's
-    // own config gives stays)
-    ...(site
-      ? {
-          config(cfg) {
-            cfg.provider ??= {}
-            const was = cfg.provider[id] ?? {}
-            cfg.provider[id] = { ...was, name: was.name ?? site.name }
-          },
-        }
-      : {}),
+    // Discover configured sites even before sign-in; keep user-given names.
+    async config(cfg) {
+      if (site) {
+        cfg.provider ??= {}
+        const was = cfg.provider[id] ?? {}
+        cfg.provider[id] = { ...was, name: was.name ?? site.name }
+      }
+      await refreshIcon(iconBase)
+    },
   }
 }
 

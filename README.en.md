@@ -17,15 +17,26 @@ magpie plugin login sub2api
 
 If the npm package is already installed, check `magpie plugin list` and switch its source to this local directory. Installing `magpie-sub2api` by package name uses the registry version, which may not contain these changes. This project does not automatically change your installed plugins or accounts.
 
-The only extra sign-in prompt is the site's **Base URL**, such as `http://179.255.97.172:3005` or `https://api.pingcodes.cc`. Do not add API operation paths or select a vendor/protocol. Paths, account names and protocol selection are automatic. Authentication still requires an API key collected separately by Magpie's API key form; the public site address alone cannot identify a private subscription or wallet.
+The only extra sign-in prompt is the site's **Base URL**, such as   `https://api.example.com`. Do not add API operation paths or select a vendor/protocol. Paths, account names and protocol selection are automatic. Authentication still requires an API key collected separately by Magpie's API key form; the public site address alone cannot identify a private subscription or wallet.
 
-Alternatively, set just `{"baseUrl":"https://api.pingcodes.cc"}` in plugin options. Sign-in then asks only for the API key. `url`, `baseURL` and `baseUrl` are accepted in that order of precedence. This default does not override a saved account URL. HTTP/HTTPS, IP addresses with ports and deployment prefixes are supported. All configuration below is optional and intended for advanced overrides.
+Alternatively, set just `{"baseUrl":"https://api.example.com"}` in plugin options. Sign-in then asks only for the API key. `url`, `baseURL` and `baseUrl` are accepted in that order of precedence. This default does not override a saved account URL. HTTP/HTTPS, IP addresses with ports and deployment prefixes are supported. All configuration below is optional and intended for advanced overrides.
 
 Each sign-in adds an account to the `sub2api` pool. Do not rename an account after first use: Magpie indexes its models and settings by that name. Previously saved account names and advanced metadata remain supported.
 
+### Automatic Site Icons
+
+With a configured site address, the plugin discovers the home page's `<link rel="icon">` / `apple-touch-icon` while loading configuration, falling back to `favicon.ico` under the deployment prefix and then at the origin root. Accounts that supply their URL only at sign-in discover their icon when loading models. HTTP/HTTPS, IP addresses with ports and deployment prefixes work without an extra image option.
+
+- Separate site providers have separate icons. The pooled `sub2api` provider uses the first account whose models are loaded during this plugin instance, so later accounts cannot overwrite it. A configured default URL supplies the icon only until an account is loaded.
+- Images reach Magpie through `auth.icon` as `data:image/…` URIs. PNG, JPEG, GIF, WebP, ICO and SVG are supported; no downloaded files are written into the repository or package.
+- Home page and image requests send no API key, custom headers or cookies. Only the configured origin is contacted, without redirects, external CDNs or parent-domain discovery. Icons requiring authentication, redirects or cross-origin requests may be unavailable.
+- Each lookup shares a three-second timeout, a 512 KiB page limit, a 1 MiB image limit and a bounded candidate count. Successful lookups cache for one hour in memory; failures cache for five minutes, with retries on later configuration/model loads. Failed refreshes retain the last icon and never break models, usage or inference.
+
+This sets the **provider picture**. Magpie's marketplace/installed plugin card uses the static package-level `magpie.icon`, which cannot follow account URLs dynamically; this plugin does not rewrite `package.json` to change that card.
+
 ## Advanced Headers and Separate Sites
 
-Add `headers` in Magpie's plugin options editor only when needed. A minimal configuration with advanced headers is `{"baseUrl":"https://api.pingcodes.cc","headers":{"User-Agent":"my-client","X-Client":"magpie"}}`. These headers apply to usage, model discovery and actual inference requests. They do not add any ordinary sign-in prompts.
+Add `headers` in Magpie's plugin options editor only when needed. A minimal configuration with advanced headers is `{"baseUrl":"https://api.example.com","headers":{"User-Agent":"my-client","X-Client":"magpie"}}`. These headers apply to usage, model discovery and actual inference requests. They do not add any ordinary sign-in prompts.
 
 ```sh
 magpie plugin options magpie-sub2api '{
@@ -108,7 +119,7 @@ npm test
 npm pack --dry-run
 ```
 
-Tests require no dependencies, Docker or credentials. They cover usage conversion, discovery, header precedence, account isolation, all four conversational protocols, explicit model aliases, path rewriting, authentication, URL checks and failure handling. A loopback HTTP test checks actual headers, SSE, cancellation and redirect rejection; it is explicitly skipped if local listening is prohibited.
+Tests require no dependencies, Docker or credentials. They cover usage conversion, discovery, header precedence, account isolation, all four conversational protocols, explicit model aliases, path rewriting, authentication, URL checks and failure handling, plus icon discovery, caching, size limits and credential isolation. Loopback HTTP tests check actual headers, SSE, cancellation, icon fetching and redirect rejection; they are explicitly skipped if local listening is prohibited.
 
 These tests do not replace live Magpie/Sub2API integration. Verify usage, model discovery and a model request in Magpie against your own site. Inspect custom headers only in logs you control, without logging credentials.
 
@@ -116,4 +127,4 @@ Plugin API reference: <https://github.com/yetone/magpie/blob/main/site/public/do
 
 ## License and Attribution
 
-Based on broven/magpie-sub2api 0.2.1 by Randy (broven), under MIT. The original copyright notice is retained in [LICENSE](./LICENSE); local extensions use MIT as well. The upstream Sub2API icon is not included because its license differs from the code's.
+Based on broven/magpie-sub2api 0.2.1 by Randy (broven), under MIT. The original copyright notice is retained in [LICENSE](./LICENSE); local extensions use MIT as well. The upstream Sub2API icon is not included because its license differs from the code's. Site icons fetched at runtime remain the property of their respective owners and are not distributed as MIT assets in this package.

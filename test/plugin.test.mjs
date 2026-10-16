@@ -14,6 +14,7 @@ const modelList = { data: [{ id: "claude-test" }, { id: "gpt-test" }, { id: "oth
 function mockAPI(t, usage = { balance: 12.34 }) {
   const calls = []
   t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (init?.credentials === "omit") return new Response(null, { status: 404 })
     calls.push({ url: String(input), ...init })
     const path = new URL(input).pathname
     if (path.endsWith("/usage")) return json(usage)
@@ -72,7 +73,7 @@ test("headers reach usage, model list and reasoning manifest with account preced
     assert.ok(call.signal instanceof AbortSignal)
   }
   const cfg = { provider: { work: { name: "User choice" } } }
-  plugin.config(cfg)
+  await plugin.config(cfg)
   assert.equal(cfg.provider.work.name, "User choice")
 })
 

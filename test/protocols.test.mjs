@@ -228,6 +228,7 @@ test("advanced headers work with only baseUrl configured and add no login prompt
   assert.deepEqual(plugin.auth.methods[0].prompts, [])
   const calls = []
   t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (init?.credentials === "omit") return new Response(null, { status: 404 })
     calls.push({ input, init })
     const url = String(input)
     return json(url.includes("backend-api") ? {} : url.endsWith("usage") ? { balance: 3 } : { data: [{ id: "deepseek-chat" }] })
