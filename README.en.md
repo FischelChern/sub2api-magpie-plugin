@@ -49,7 +49,7 @@ The same JSON can be entered in Magpie's plugin options editor. A site provider 
 
 Header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The final merged headers are enforced in the account's fetch function, so callers cannot override them. Values are literal; environment expansion and templates are not supported.
 
-Inference automatically sets a protocol-specific compatibility `User-Agent` (not the SDK version installed by the host):
+Inference preserves the `User-Agent` supplied by Magpie. Only requests without that header receive a protocol-specific compatibility default (not the SDK version installed by the host):
 
 | API protocol | Default `User-Agent` |
 | --- | --- |
@@ -58,7 +58,9 @@ Inference automatically sets a protocol-specific compatibility `User-Agent` (not
 | `anthropic` | `anthropic-typescript (magpie-sub2api)` |
 | `gemini` | `google-genai-sdk (magpie-sub2api)` |
 
-Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Precedence is **caller headers < protocol defaults < global headers < site headers < account headers**, case-insensitively. An explicit `User-Agent`, including an empty string, overrides the automatic value; remove any old override to enable automatic selection. Usage, model discovery and Codex reasoning-level queries do not receive these defaults and keep their existing custom headers.
+Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Precedence is **protocol defaults < caller headers < global headers < site headers < account headers**, case-insensitively. A caller-supplied `User-Agent`, including an empty string, is preserved; explicitly configured values still take precedence. Remove any old override to use Magpie's UA, falling back to automatic selection only when absent. Usage, model discovery and Codex reasoning-level queries do not receive these defaults and keep their existing custom headers.
+
+Except for authentication and HTTP transport-managed headers, inference forwards the caller's other request headers. Consequently, Codex's `originator`, `session-id` and all `x-codex-*` headers reach the key-and-URL provider unchanged; duplicate values in `init.headers` override `Request.headers`, while explicitly configured global, site or account headers still have higher precedence. These headers can contain client and session identifiers, so send them only to trusted providers.
 
 These identifiers provide protocol compatibility; they do not make Magpie an official client or change account permissions. If `This account only allows Codex official clients` persists, the site may also validate request bodies or other client characteristics. Ask the administrator to allow compatible clients for the account, or use a supported official client.
 

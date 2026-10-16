@@ -169,8 +169,8 @@ function accountFetch(base, key, extra, routing) {
     if (protocol === "gemini") target.searchParams.delete("key")
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
-    // Replace generic host/SDK identity, but keep explicit account configuration.
-    if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
+    // Preserve the host's identity; protocol defaults only fill a missing UA.
+    if (protocol && !headers.has("user-agent")) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
     for (const [name, value] of Object.entries(extra)) headers.set(name, value)
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)

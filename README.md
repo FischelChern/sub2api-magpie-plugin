@@ -112,7 +112,7 @@ magpie plugin login backup
 
 ### 自动 User-Agent
 
-实际模型请求按 API 协议自动设置以下兼容标识（不是宿主实际安装的 SDK 版本），无需额外配置：
+实际模型请求保留 Magpie 传入的 `User-Agent`；仅在请求未携带该头时，按 API 协议补充以下兼容标识（不是宿主实际安装的 SDK 版本）：
 
 | API 协议 | 默认 `User-Agent` |
 | --- | --- |
@@ -121,7 +121,9 @@ magpie plugin login backup
 | `anthropic` | `anthropic-typescript (magpie-sub2api)` |
 | `gemini` | `google-genai-sdk (magpie-sub2api)` |
 
-选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。优先级为 **调用方请求头 < 协议默认值 < 全局 headers < 站点 headers < 账号 headers**，同名头不区分大小写。显式配置的 `User-Agent`（包括空字符串）会覆盖自动值；若已有旧配置，请删除它以启用自动选择。用量、模型列表和 Codex 思考等级查询不添加这些默认标识，仍使用原有的自定义请求头。
+选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。优先级为 **协议默认值 < 调用方请求头 < 全局 headers < 站点 headers < 账号 headers**，同名头不区分大小写。调用方传入的 `User-Agent`（包括空字符串）会保留，显式配置的值仍优先；若已有旧配置，请删除它以使用 Magpie 传入的 UA，缺失时才自动补充。用量、模型列表和 Codex 思考等级查询不添加这些默认标识，仍使用原有的自定义请求头。
+
+除认证头和由 HTTP 客户端管理的传输头外，实际模型请求会透传调用方的其他请求头。因此，Codex 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头也会原样到达 key+URL 供应商；`init.headers` 中的同名值会覆盖 `Request.headers`，显式配置的全局、站点或账号请求头仍具有更高优先级。这些头可能包含客户端和会话标识，只应发送给可信供应商。
 
 这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。如果仍返回 `This account only allows Codex official clients`，站点可能还校验请求体或其他客户端特征；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
 
