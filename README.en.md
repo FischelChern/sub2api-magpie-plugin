@@ -171,7 +171,7 @@ Values are illustrative: use your site's actual capabilities and prices. Overrid
 
 ### Select Fast / Ultraspeed On The Original Model
 
-The catalog contains only real IDs returned by the site. Supported service tiers reported for the current key are attached to each original model as `serviceTiers`. Magpie can offer them to agents that understand tier catalogs, such as compatible Codex versions. No `-fast` / `-ultraspeed` models are generated, and model IDs, display names, reasoning levels and default speeds stay unchanged.
+The catalog contains only real IDs returned by the site. Supported service tiers reported for the current key are attached to each original model as `serviceTiers`. Magpie can offer them to agents that understand tier catalogs, such as compatible Codex versions. No `-fast` / `-ultraspeed` models are generated, and model IDs, reasoning levels and default speeds stay unchanged. Trailing `(fast)`, `(ultraspeed)` and `(ultrafast)` display labels, including fullwidth parentheses, are removed from site, host-cached and custom names. Real IDs are never cleaned. Speed capabilities are declared only through parameter metadata, never inferred from name labels.
 
 | Agent selection | OpenAI-compatible request parameter | Upstream model ID |
 | --- | --- | --- |

@@ -719,6 +719,13 @@ const LEVELS = ["low", "medium", "high"]
 
 const variantsOf = (levels) => Object.fromEntries(levels.map((l) => [l, {}]))
 
+function modelDisplayName(name, id) {
+  if (typeof name !== "string" || name === id) return id
+  // Speed belongs in serviceTiers, not trailing display labels. Keep real IDs intact.
+  const clean = name.replace(/(?:\s*(?:\(\s*(?:fast|ultraspeed|ultrafast)\s*\)|\uFF08\s*(?:fast|ultraspeed|ultrafast)\s*\uFF09))+\s*$/i, "")
+  return clean.trim() ? clean : id
+}
+
 // runtimeModel is magpie's model. Its variants are its reasoning levels
 // (magpie offers a thinking model's variants' keys as its efforts), the
 // first of: the levels the site tells (told), the variants magpie already
@@ -828,7 +835,7 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
     const name = named ? display : m.id
     const protocol = modelProtocol(m.id, routing)
     out[m.id] = runtimeModel({ id: m.id, name, named }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
-    if (selection.modelNames[m.id]) out[m.id].name = selection.modelNames[m.id]
+    out[m.id].name = modelDisplayName(selection.modelNames[m.id] ?? out[m.id].name, m.id)
     out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
   }
   report("models.ready", { discovered: entries.length, visible: Object.keys(out).length })

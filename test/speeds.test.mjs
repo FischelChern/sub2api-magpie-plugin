@@ -60,6 +60,58 @@ test("missing capabilities never infer speeds from model names, protocols or ano
   }
 })
 
+test("display names strip trailing speed labels without changing IDs or inferring tier support", async (t) => {
+  const entries = [
+    { id: "gpt-fast-label", display_name: "GPT Example (fast)", service_tiers: ["priority", "ultrafast"] },
+    { id: "gpt-wide-label", name: "GPT Example \uFF08 FaSt \uFF09" },
+    { id: "gpt-ultra-label", display_name: "GPT Example (ULTRASPEED)" },
+    { id: "gpt-stacked-label", display_name: "GPT Example (fast) \uFF08ultrafast\uFF09  " },
+    { id: "gpt-interior", display_name: "GPT (fast) Example (preview)" },
+    { id: "gpt-label-only", display_name: " (fast) " },
+    { id: "gpt-real-fast" },
+    { id: "gpt-real (fast)" },
+  ]
+  const original = structuredClone(entries)
+  mockAPI(t, { entries })
+  const plugin = await Sub2apiPlugin()
+  const found = await plugin.provider.models(provider, { auth: account() })
+  assert.deepEqual(Object.keys(found), entries.map((m) => m.id))
+  for (const id of ["gpt-fast-label", "gpt-wide-label", "gpt-ultra-label", "gpt-stacked-label"]) {
+    assert.equal(found[id].name, "GPT Example")
+  }
+  assert.equal(found["gpt-interior"].name, "GPT (fast) Example (preview)")
+  for (const id of ["gpt-label-only", "gpt-real-fast", "gpt-real (fast)"]) assert.equal(found[id].name, id)
+  for (const model of Object.values(found)) {
+    assert.equal(model.api.id, model.id)
+    assert.deepEqual(model.serviceTiers, model.id === "gpt-fast-label" ? ["priority", "ultrafast"] : [])
+  }
+  assert.deepEqual(entries, original)
+})
+
+test("speed labels are removed after host, override and configured name precedence without mutating sources", async (t) => {
+  mockAPI(t, { entries: ["gpt-host", "gpt-override", "gpt-configured"] })
+  const known = { models: {
+    "gpt-host": { name: "Host Name (fast)" },
+    "gpt-override": { name: "Old Name (fast)" },
+    "gpt-configured": { name: "Old Name (fast)" },
+  } }
+  const options = {
+    modelNames: { "gpt-configured": "Configured Name \uFF08ultraspeed\uFF09" },
+    modelOverrides: {
+      "gpt-override": { name: "Override Name (ULTRAFAST)", serviceTiers: ["fast", "ultraspeed"] },
+      "gpt-configured": { name: "Lower Priority Name (fast)" },
+    },
+  }
+  const original = structuredClone({ known, options })
+  const plugin = await Sub2apiPlugin({}, options)
+  const found = await plugin.provider.models(known, { auth: account() })
+  assert.equal(found["gpt-host"].name, "Host Name")
+  assert.equal(found["gpt-override"].name, "Override Name")
+  assert.equal(found["gpt-configured"].name, "Configured Name")
+  assert.deepEqual(found["gpt-override"].serviceTiers, ["priority", "ultrafast"])
+  assert.deepEqual({ known, options }, original)
+})
+
 test("the same key's Codex manifest supplies tiers independently of reasoning levels", async (t) => {
   mockAPI(t, {
     entries: ["gpt-test", "gpt-other", "gpt-none"],
