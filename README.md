@@ -1,6 +1,6 @@
 [English](./README.en.md)
 
-# magpie-sub2api
+# sub2api-magpie-plugin
 
 将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 站点接入 [Magpie](https://usemagpie.ai)：查看当前 API key 对应的套餐、余额和模型，并在查询和模型发送请求中附加自定义请求头。
 
@@ -38,7 +38,9 @@ magpie plugin add "$PWD"
 magpie plugin login sub2api
 ```
 
-如果之前安装过 npm 版同名插件，先确认 `magpie plugin list`，再将插件来源切换到此本地目录。`magpie plugin add magpie-sub2api` 安装的是注册表版本，不保证包含本项目的改动。本项目没有自动修改本机现有插件、账号或配置。
+本项目包名为 `sub2api-magpie-plugin`；旧名称 `magpie-sub2api` 不再用于本项目的插件选项命令。已安装旧名称或 npm 版本时，先确认 `magpie plugin list`，再将插件来源切换到此本地目录，避免同时加载两个提供相同 provider 的插件。按包名安装依赖 npm 是否已发布，本次更名不自动发布。本项目没有自动修改本机现有插件、账号或配置。
+
+更名不改变 provider ID：默认登录仍使用 `magpie plugin login sub2api`，模型仍为 `sub2api/<模型>`；已有账号和自定义站点 ID 不变。插件选项命令改用 `magpie plugin options sub2api-magpie-plugin`。
 
 普通使用只需要配置站点 **Base URL**，例如：
 
@@ -105,7 +107,7 @@ https://api.example.com
 ### 全局和站点
 
 ```sh
-magpie plugin options magpie-sub2api '{
+magpie plugin options sub2api-magpie-plugin '{
   "headers": {
     "User-Agent": "my-magpie-client",
     "X-Client": "magpie"
@@ -145,10 +147,10 @@ magpie plugin login backup
 
 | API 协议 | 默认 `User-Agent` |
 | --- | --- |
-| `responses`（GPT / Codex 默认） | `codex_cli_rs/0.146.0 (magpie-sub2api)` |
-| `chat-completions` | `OpenAI/JS (magpie-sub2api)` |
-| `anthropic` | `anthropic-typescript (magpie-sub2api)` |
-| `gemini` | `google-genai-sdk (magpie-sub2api)` |
+| `responses`（GPT / Codex 默认） | `codex_cli_rs/0.146.0 (sub2api-magpie-plugin)` |
+| `chat-completions` | `OpenAI/JS (sub2api-magpie-plugin)` |
+| `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
+| `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
 
 选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。UA 优先级为 **调用方 UA < 协议默认 UA < protocolHeaders < 全局 headers < 站点 headers < 账号 headers**，同名头不区分大小写。要自动按协议切换 UA，请删除普通 `headers` 中旧的 `User-Agent` 覆盖；要为 Codex 和 Claude 分别指定 UA，请使用 `protocolHeaders.codex` / `protocolHeaders.claude`。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些默认标识，仍使用原有的自定义请求头。
 

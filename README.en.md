@@ -1,6 +1,6 @@
 [中文](./README.md)
 
-# magpie-sub2api
+# sub2api-magpie-plugin
 
 Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) site to [Magpie](https://usemagpie.ai). Display the current API key's plan, usage, balance and models, and attach configurable headers to discovery, usage and model requests.
 
@@ -15,7 +15,9 @@ magpie plugin add "$PWD"
 magpie plugin login sub2api
 ```
 
-If the npm package is already installed, check `magpie plugin list` and switch its source to this local directory. Installing `magpie-sub2api` by package name uses the registry version, which may not contain these changes. This project does not automatically change your installed plugins or accounts.
+This package is named `sub2api-magpie-plugin`; the old name `magpie-sub2api` is no longer used for this project's plugin-options commands. If an old-name or npm version is installed, check `magpie plugin list` and switch its source to this local directory. Avoid loading two plugins that provide the same provider. Installation by package name depends on publication to npm; this rename does not publish the package. This project does not automatically change installed plugins, accounts or configuration.
+
+Provider IDs are unchanged: sign in with `magpie plugin login sub2api` and select `sub2api/<model>`. Existing accounts and custom site IDs remain intact. Plugin options now use `magpie plugin options sub2api-magpie-plugin`.
 
 The only extra sign-in prompt is the site's **Base URL**, such as `https://api.example.com`. Do not add API operation paths or select a vendor/protocol. Paths, account names and protocol selection are automatic. Authentication still requires an API key collected separately by Magpie's API key form; the public site address alone cannot identify a private subscription or wallet.
 
@@ -56,7 +58,7 @@ configured header with the same name still wins. Accounts may also set
 `metadata.protocolHeaders`.
 
 ```sh
-magpie plugin options magpie-sub2api '{
+magpie plugin options sub2api-magpie-plugin '{
   "headers": {
     "User-Agent": "my-magpie-client",
     "X-Client": "magpie"
@@ -81,10 +83,10 @@ Inference sets a protocol-specific compatibility `User-Agent`, replacing Magpie'
 
 | API protocol | Default `User-Agent` |
 | --- | --- |
-| `responses` (default for GPT / Codex) | `codex_cli_rs/0.146.0 (magpie-sub2api)` |
-| `chat-completions` | `OpenAI/JS (magpie-sub2api)` |
-| `anthropic` | `anthropic-typescript (magpie-sub2api)` |
-| `gemini` | `google-genai-sdk (magpie-sub2api)` |
+| `responses` (default for GPT / Codex) | `codex_cli_rs/0.146.0 (sub2api-magpie-plugin)` |
+| `chat-completions` | `OpenAI/JS (sub2api-magpie-plugin)` |
+| `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
+| `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
 
 Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. UA precedence is **caller UA < protocol default UA < protocolHeaders < global headers < site headers < account headers**, case-insensitively. Remove any old `User-Agent` override from ordinary `headers` to switch automatically by protocol; use `protocolHeaders.codex` / `protocolHeaders.claude` for separate explicit UAs. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these defaults and keep their existing custom headers.
 

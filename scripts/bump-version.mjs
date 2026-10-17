@@ -46,8 +46,8 @@ try {
     writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n")
     required("add", "--", "package.json")
   }
-  console.log("magpie-sub2api: commit version " + target)
+  console.log("sub2api-magpie-plugin: commit version " + target)
 } catch (error) {
-  console.error("magpie-sub2api: " + error.message)
+  console.error("sub2api-magpie-plugin: " + error.message)
   process.exitCode = 1
 }

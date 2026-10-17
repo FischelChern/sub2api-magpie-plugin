@@ -1,4 +1,4 @@
-// magpie-sub2api: any sub2api site (github.com/Wei-Shaw/sub2api) as a
+// sub2api-magpie-plugin: any sub2api site (github.com/Wei-Shaw/sub2api) as a
 // magpie provider. Sign in with the site's address and an API key; the
 // models the key's group serves are spoken to on the site's own endpoints,
 // and auth.usage tells magpie what the key has left (its subscription's day,
@@ -33,10 +33,10 @@ const PROTOCOLS = { anthropic: MESSAGES, responses: RESPONSES, "chat-completions
 const DEFAULT_PATHS = { anthropic: "/v1", responses: "/v1", "chat-completions": "/v1", gemini: "/v1beta" }
 // Compatibility identifiers, not the SDK versions installed by the host.
 const PROTOCOL_USER_AGENTS = {
-  anthropic: "anthropic-typescript (magpie-sub2api)",
-  responses: "codex_cli_rs/0.146.0 (magpie-sub2api)",
-  "chat-completions": "OpenAI/JS (magpie-sub2api)",
-  gemini: "google-genai-sdk (magpie-sub2api)",
+  anthropic: "anthropic-typescript (sub2api-magpie-plugin)",
+  responses: "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)",
+  "chat-completions": "OpenAI/JS (sub2api-magpie-plugin)",
+  gemini: "google-genai-sdk (sub2api-magpie-plugin)",
 }
 const TIMEOUT = 15_000
 const METADATA_BODY_MAX = 1 << 20
@@ -53,7 +53,7 @@ const QUERY_DEFAULTS = {
   maxResponseBytes: 4 << 20,
 }
 const CACHE_MAX = 128
-const SPEED_HEADER = "x-magpie-sub2api-speed-model"
+const SPEED_HEADER = "x-sub2api-magpie-plugin-speed-model"
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
 
 const HOUR = 3600
@@ -91,7 +91,7 @@ function diagnostics(...layers) {
   // Only fixed event names, status codes and timings reach stderr, never URLs,
   // account names, model names, response bodies or headers.
   return (event, details = {}) => {
-    if (enabled) console.error("magpie-sub2api: " + JSON.stringify({ event, ...details }))
+    if (enabled) console.error("sub2api-magpie-plugin: " + JSON.stringify({ event, ...details }))
   }
 }
 
@@ -943,7 +943,7 @@ function sitesOf(options, tell) {
   const out = []
   const seen = new Set([ID])
   for (const [i, s] of list.entries()) {
-    const why = (m) => tell && console.error(`magpie-sub2api: options.sites[${i}] left out: ${m}`)
+    const why = (m) => tell && console.error(`sub2api-magpie-plugin: options.sites[${i}] left out: ${m}`)
     const bad = checkURL(s?.url ?? s?.baseURL ?? s?.baseUrl)
     if (bad) {
       why(bad)

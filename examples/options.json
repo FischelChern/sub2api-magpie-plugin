@@ -1,7 +1,7 @@
 {
   "protocol": "auto",
   "headers": {
-    "X-Client": "magpie-sub2api"
+    "X-Client": "sub2api-magpie-plugin"
   },
   "protocolHeaders": {
     "codex": {

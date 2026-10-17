@@ -5,7 +5,7 @@ import test from "node:test"
 import { Sub2apiPlugin, Sub2apiSite1 } from "../index.mjs"
 
 const BASE = "https://speeds.example.com/deployment"
-const HEADER = "x-magpie-sub2api-speed-model"
+const HEADER = "x-sub2api-magpie-plugin-speed-model"
 const account = (key = "speed-test-key", baseURL = BASE, metadata = {}) => ({ type: "api", key, metadata: { baseURL, ...metadata } })
 const provider = { models: {} }
 

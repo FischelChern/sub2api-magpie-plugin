@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { createServer } from "node:http"
 import { once } from "node:events"
+import { readFile } from "node:fs/promises"
 import test from "node:test"
 import * as plugins from "../index.mjs"
 
@@ -29,6 +30,14 @@ function mockAPI(t, usage = { balance: 12.34 }) {
 test("only provider plugin functions are exported", () => {
   assert.equal(Object.keys(plugins).length, 9)
   for (const value of Object.values(plugins)) assert.equal(typeof value, "function")
+})
+
+test("the renamed package keeps the existing provider identity for saved accounts", async () => {
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  assert.equal(pkg.name, "sub2api-magpie-plugin")
+  const plugin = await plugins.Sub2apiPlugin()
+  assert.equal(plugin.auth.provider, "sub2api")
+  assert.equal(plugin.provider.id, "sub2api")
 })
 
 test("pooled provider signs in and names an account without dropping metadata", async () => {
@@ -128,12 +137,12 @@ test("inference fills missing user agents by endpoint including rewritten paths 
   const response = json({})
   t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return response })
   for (const [path, userAgent] of [
-    ["/v1/responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
-    ["/openai/v1/responses/compact", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
-    ["/v1/chat/completions", "OpenAI/JS (magpie-sub2api)"],
-    ["/v1/messages", "anthropic-typescript (magpie-sub2api)"],
-    ["/v1beta/models/gemini-test:streamGenerateContent", "google-genai-sdk (magpie-sub2api)"],
-    ["/v1/responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
+    ["/v1/responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
+    ["/openai/v1/responses/compact", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
+    ["/v1/chat/completions", "OpenAI/JS (sub2api-magpie-plugin)"],
+    ["/v1/messages", "anthropic-typescript (sub2api-magpie-plugin)"],
+    ["/v1beta/models/gemini-test:streamGenerateContent", "google-genai-sdk (sub2api-magpie-plugin)"],
+    ["/v1/responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
   ]) {
     for (const kind of ["string", "URL", "Request"]) {
       const url = BASE + "/prefix" + path
@@ -150,7 +159,7 @@ test("inference fills missing user agents by endpoint including rewritten paths 
     }
   }
   await loader.fetch(BASE + "/prefix/v1/responses")
-  assert.equal(calls.at(-1).init.headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
+  assert.equal(calls.at(-1).init.headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
   const count = calls.length
   await assert.rejects(loader.fetch("https://other.example.com/prefix/v1/responses"), /Refusing/)
   assert.equal(calls.length, count)
@@ -162,10 +171,10 @@ test("inference replaces host user agents by protocol including empty values and
   const calls = []
   t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
   for (const [path, expected] of [
-    ["responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
-    ["messages", "anthropic-typescript (magpie-sub2api)"],
-    ["chat/completions", "OpenAI/JS (magpie-sub2api)"],
-    ["models/gemini-test:generateContent", "google-genai-sdk (magpie-sub2api)"],
+    ["responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
+    ["messages", "anthropic-typescript (sub2api-magpie-plugin)"],
+    ["chat/completions", "OpenAI/JS (sub2api-magpie-plugin)"],
+    ["models/gemini-test:generateContent", "google-genai-sdk (sub2api-magpie-plugin)"],
   ]) {
     const url = BASE + "/v1/" + path
     for (const userAgent of ["magpie/0.1.1271", "codex-tui/0.162.1", ""]) {
@@ -195,7 +204,7 @@ test("inference preserves Codex identity and session headers except the protocol
     "x-codex-source": "codex-tui",
   } })
   const headers = calls[0]
-  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
+  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
   assert.equal(headers.get("originator"), "codex_cli_rs")
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
@@ -243,7 +252,7 @@ test("Responses promotes existing Codex body metadata without changing the body 
     assert.equal(call.url, BASE + "/openai/v1/responses/compact", source)
     assert.equal(call.body, body, source)
     assert.equal(call.signal, controller.signal)
-    assert.equal(call.headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
+    assert.equal(call.headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
     assert.equal(call.headers.get("session-id"), metadata.session_id)
     assert.equal(call.headers.get("thread-id"), metadata.thread_id)
     for (const name of ["x-codex-window-id", "x-codex-installation-id", "x-codex-turn-metadata", "x-codex-source"]) {
@@ -679,14 +688,14 @@ test("real HTTP sends headers, preserves streaming, cancellation and refuses red
   assert.equal(await metadataResponse.text(), 'data: {"ok":true}\n\ndata: [DONE]\n\n')
   assert.equal(calls.at(-1).path, "/openai/v1/responses")
   assert.equal(calls.at(-1).body, body)
-  assert.equal(calls.at(-1).headers["user-agent"], "codex_cli_rs/0.146.0 (magpie-sub2api)")
+  assert.equal(calls.at(-1).headers["user-agent"], "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
   assert.equal(calls.at(-1).headers["session-id"], "loopback-session")
   assert.equal(calls.at(-1).headers["x-codex-window-id"], "loopback-session:0")
   assert.equal(calls.at(-1).headers["x-codex-turn-metadata"], '{"turn_id":"loopback-turn"}')
   assert.equal(calls.at(-1).headers.authorization, `Bearer ${account.key}`)
   const claudeResponse = await automaticLoader.fetch(base + "/v1/messages", { method: "POST", body, headers: { "User-Agent": "magpie/test" } })
   await claudeResponse.text()
-  assert.equal(calls.at(-1).headers["user-agent"], "anthropic-typescript (magpie-sub2api)")
+  assert.equal(calls.at(-1).headers["user-agent"], "anthropic-typescript (sub2api-magpie-plugin)")
   assert.equal(calls.at(-1).headers["x-codex-window-id"], undefined)
   await assert.rejects(loader.fetch(base + "/v1/redirect"))
   assert.equal(calls.some((c) => c.path === "/v1/target"), false)
