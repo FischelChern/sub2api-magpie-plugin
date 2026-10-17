@@ -84,6 +84,21 @@ https://api.example.com
 
 这里的 `headers` 对套餐/余额查询、模型列表和实际模型发送均生效；没有特殊要求时保留空对象或省略。
 
+如果 Codex 和 Claude 需要不同的客户端标识，可用 `protocolHeaders` 按协议配置。`codex` 是
+`responses` 的别名，`claude` 是 `anthropic` 的别名；这些头只附加到实际模型请求，不会发送到用量或模型发现接口。
+
+```json
+{
+  "protocolHeaders": {
+    "codex": { "originator": "codex_cli_rs" },
+    "claude": { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+  }
+}
+```
+
+协议请求头的优先级低于全局、站点和账号 `headers`，同名头仍由后者覆盖；账号也可在
+`metadata.protocolHeaders` 中单独配置。
+
 ### 全局和站点
 
 ```sh

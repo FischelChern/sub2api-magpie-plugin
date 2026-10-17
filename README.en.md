@@ -38,6 +38,23 @@ This sets the **provider picture**. Magpie's marketplace/installed plugin card u
 
 Add `headers` in Magpie's plugin options editor only when needed. A minimal configuration with advanced headers is `{"baseUrl":"https://api.example.com","headers":{"User-Agent":"my-client","X-Client":"magpie"}}`. These headers apply to usage, model discovery and actual inference requests. They do not add any ordinary sign-in prompts.
 
+When Codex and Claude need different client identity headers, use `protocolHeaders`.
+`codex` aliases `responses`, and `claude` aliases `anthropic`; these headers are attached only
+to inference requests, not usage or model discovery:
+
+```json
+{
+  "protocolHeaders": {
+    "codex": { "originator": "codex_cli_rs" },
+    "claude": { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+  }
+}
+```
+
+Protocol headers have lower precedence than global, site and account `headers`; an explicitly
+configured header with the same name still wins. Accounts may also set
+`metadata.protocolHeaders`.
+
 ```sh
 magpie plugin options magpie-sub2api '{
   "headers": {

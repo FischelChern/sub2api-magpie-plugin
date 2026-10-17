@@ -33,6 +33,7 @@
     "options": {
       "protocol": "auto",
       "headers": {},
+      "protocolHeaders": {},
       "modelProtocols": {},
       "apiPaths": {},
       "sites": []

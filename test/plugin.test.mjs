@@ -197,6 +197,25 @@ test("inference preserves Codex identity and session headers", async (t) => {
   assert.equal(headers.get("x-codex-source"), "codex-tui")
 })
 
+test("inference applies protocol-specific Codex and Claude headers", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, {
+    protocolHeaders: {
+      codex: { originator: "codex_cli_rs", "x-codex-source": "codex-tui" },
+      claude: { "anthropic-beta": "interleaved-thinking-2025-05-14" },
+    },
+  })
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  await loader.fetch(BASE + "/v1/responses")
+  await loader.fetch(BASE + "/v1/messages")
+  assert.equal(calls[0].get("originator"), "codex_cli_rs")
+  assert.equal(calls[0].get("x-codex-source"), "codex-tui")
+  assert.equal(calls[0].get("anthropic-beta"), null)
+  assert.equal(calls[1].get("anthropic-beta"), "interleaved-thinking-2025-05-14")
+  assert.equal(calls[1].get("originator"), null)
+})
+
 test("explicit user agents override protocol defaults with isolated global site and account precedence", async (t) => {
   const options = {
     headers: { "USER-AGENT": "global" },
@@ -305,6 +324,11 @@ test("invalid headers fail validation without exposing their values", async () =
     assert.ok(usage.error)
     assert.equal(usage.error.includes("secret"), false)
   }
+})
+
+test("invalid protocol-specific headers fail validation", async () => {
+  await assert.rejects(plugins.Sub2apiPlugin({}, { protocolHeaders: { codex: { Authorization: "secret" } } }), /reserved/)
+  await assert.rejects(plugins.Sub2apiPlugin({}, { protocolHeaders: { unknown: { "X-Test": "value" } } }), /Protocol must be/)
 })
 
 test("addresses reject embedded credentials, queries, fragments and non-HTTP schemes", async () => {

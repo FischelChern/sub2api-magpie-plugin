@@ -139,6 +139,26 @@ function routingOf(...layers) {
   return routing
 }
 
+// Optional headers for a protocol are used only by inference requests for
+// that protocol.  This lets Codex and Claude clients carry different identity
+// headers while retaining the existing global/site/account headers.
+function protocolHeadersOf(...layers) {
+  const out = Object.create(null)
+  for (const layer of layers) {
+    if (!layer || layer.protocolHeaders === undefined) continue
+    const value = layer.protocolHeaders
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("protocolHeaders must be a JSON object")
+    }
+    for (const [name, headers] of Object.entries(value)) {
+      const protocol = protocolOf(name === "codex" ? "responses" : name === "claude" ? "anthropic" : name)
+      if (protocol === "auto") throw new Error("protocolHeaders requires explicit protocols")
+      out[protocol] = { ...(out[protocol] ?? {}), ...customHeaders(headers) }
+    }
+  }
+  return out
+}
+
 function modelProtocol(id, routing) {
   const protocol = routing.modelProtocols[id] ?? routing.protocol
   if (protocol !== "auto") return protocol
@@ -149,7 +169,7 @@ function modelProtocol(id, routing) {
   return "chat-completions"
 }
 
-function accountFetch(base, key, extra, routing) {
+function accountFetch(base, key, extra, routing, protocolExtra = {}) {
   // The host's loader baseURL overrides individual model URLs. Resolve the
   // protocol from its generated endpoint and route it to the configured path.
   const prefixes = [...new Set([...Object.values(DEFAULT_PATHS), ...Object.values(routing.apiPaths)])]
@@ -174,6 +194,7 @@ function accountFetch(base, key, extra, routing) {
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
     // Preserve the host's identity; protocol defaults only fill a missing UA.
     if (protocol && !headers.has("user-agent")) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
+    for (const [name, value] of Object.entries(protocolExtra[protocol] ?? {})) headers.set(name, value)
     for (const [name, value] of Object.entries(extra)) headers.set(name, value)
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
@@ -565,6 +586,8 @@ function hooks(client, id, site, options) {
   const headersOf = (auth) => mergedHeaders(configured, auth?.metadata?.headers)
   const configuredRouting = routingOf(options, site)
   const routingFor = (auth) => routingOf(configuredRouting, auth?.metadata)
+  const configuredProtocolHeaders = protocolHeadersOf(options, site)
+  const protocolHeadersFor = (auth) => protocolHeadersOf({ protocolHeaders: configuredProtocolHeaders }, auth?.metadata)
   const defaultURL = options?.url ?? options?.baseURL ?? options?.baseUrl
   if (defaultURL !== undefined) {
     const bad = checkURL(defaultURL)
@@ -623,7 +646,8 @@ function hooks(client, id, site, options) {
       // gateway takes either
       const headers = headersOf(auth)
       const routing = routingFor(auth)
-      return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing) }
+      const protocolHeaders = protocolHeadersFor(auth)
+      return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing, protocolHeaders) }
     },
     methods: [
       {
