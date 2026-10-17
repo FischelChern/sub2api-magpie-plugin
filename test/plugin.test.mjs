@@ -156,25 +156,30 @@ test("inference fills missing user agents by endpoint including rewritten paths 
   assert.equal(calls.length, count)
 })
 
-test("inference preserves host user agents including empty values and init overrides", async (t) => {
+test("inference replaces host user agents by protocol including empty values and init overrides", async (t) => {
   const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
   const loader = await plugin.auth.loader(async () => auth())
   const calls = []
   t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
-  for (const path of ["responses", "messages", "chat/completions", "models/gemini-test:generateContent"]) {
+  for (const [path, expected] of [
+    ["responses", "codex_cli_rs/0.146.0 (magpie-sub2api)"],
+    ["messages", "anthropic-typescript (magpie-sub2api)"],
+    ["chat/completions", "OpenAI/JS (magpie-sub2api)"],
+    ["models/gemini-test:generateContent", "google-genai-sdk (magpie-sub2api)"],
+  ]) {
     const url = BASE + "/v1/" + path
     for (const userAgent of ["magpie/0.1.1271", "codex-tui/0.162.1", ""]) {
       for (const input of [url, new URL(url), new Request(url, { headers: { "User-Agent": "request-client" } })]) {
         await loader.fetch(input, { headers: { "uSeR-aGeNt": userAgent } })
-        assert.equal(calls.at(-1).get("user-agent"), userAgent)
+        assert.equal(calls.at(-1).get("user-agent"), expected)
       }
       await loader.fetch(new Request(url, { headers: { "User-Agent": userAgent } }))
-      assert.equal(calls.at(-1).get("user-agent"), userAgent)
+      assert.equal(calls.at(-1).get("user-agent"), expected)
     }
   }
 })
 
-test("inference preserves Codex identity and session headers", async (t) => {
+test("inference preserves Codex identity and session headers except the protocol-managed user agent", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => auth())
   const calls = []
@@ -190,11 +195,223 @@ test("inference preserves Codex identity and session headers", async (t) => {
     "x-codex-source": "codex-tui",
   } })
   const headers = calls[0]
-  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.162.0")
+  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
   assert.equal(headers.get("originator"), "codex_cli_rs")
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
   assert.equal(headers.get("x-codex-source"), "codex-tui")
+})
+
+test("Responses promotes existing Codex body metadata without changing the body or routing", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
+  const loader = await plugin.auth.loader(async () => auth())
+  const metadata = {
+    session_id: "body-session",
+    thread_id: "body-thread",
+    "x-codex-window-id": "body-session:0",
+    "x-codex-installation-id": "test-installation",
+    "x-codex-turn-metadata": JSON.stringify({ turn_id: "test-turn" }),
+    "x-codex-source": "test-client",
+    authorization: "never-copy",
+    "x-api-key": "never-copy",
+    "x-other": "never-copy",
+    turn_id: "never-copy",
+  }
+  const body = JSON.stringify({ model: "gpt-test", stream: true, client_metadata: metadata })
+  const calls = []
+  const response = new Response("data: test\n\n", { headers: { "content-type": "text/event-stream" } })
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    calls.push({ url: input instanceof Request ? input.url : String(input), headers: init.headers, signal: init.signal, body: await new Request(input, init).text() })
+    return response
+  })
+  const url = BASE + "/v1/responses/compact"
+  for (const source of ["string", "URL", "Request", "override", "buffer", "array-buffer", "view", "blob"]) {
+    const controller = new AbortController()
+    const bytes = new TextEncoder().encode(body)
+    const input = source === "Request" ? new Request(url, { method: "POST", body })
+      : source === "override" ? new Request(url, { method: "POST", body: '{"client_metadata":{"session_id":"wrong"}}' })
+      : source === "URL" ? new URL(url) : url
+    const requestBody = source === "Request" ? undefined
+      : source === "buffer" ? Buffer.from(body)
+      : source === "array-buffer" ? bytes.buffer
+      : source === "view" ? new DataView(bytes.buffer)
+      : source === "blob" ? new Blob([body]) : body
+    assert.equal(await loader.fetch(input, {
+      method: "POST", body: requestBody, signal: controller.signal, headers: { "User-Agent": "magpie/test" },
+    }), response)
+    const call = calls.at(-1)
+    assert.equal(call.url, BASE + "/openai/v1/responses/compact", source)
+    assert.equal(call.body, body, source)
+    assert.equal(call.signal, controller.signal)
+    assert.equal(call.headers.get("user-agent"), "codex_cli_rs/0.146.0 (magpie-sub2api)")
+    assert.equal(call.headers.get("session-id"), metadata.session_id)
+    assert.equal(call.headers.get("thread-id"), metadata.thread_id)
+    for (const name of ["x-codex-window-id", "x-codex-installation-id", "x-codex-turn-metadata", "x-codex-source"]) {
+      assert.equal(call.headers.get(name), metadata[name])
+    }
+    assert.equal(call.headers.get("authorization"), `Bearer ${auth().key}`)
+    for (const name of ["x-api-key", "x-other", "turn_id", "originator"]) assert.equal(call.headers.has(name), false)
+  }
+})
+
+test("metadata only fills missing headers and configured protocol and account headers still win", async (t) => {
+  const plugin = await plugins.Sub2apiSite1({}, {
+    headers: { "User-Agent": "global" },
+    protocolHeaders: { codex: { "User-Agent": "protocol", "x-codex-window-id": "protocol-window" } },
+    sites: [{ id: "work", url: BASE, headers: { "User-Agent": "site" } }],
+  })
+  const loader = await plugin.auth.loader(async () => auth({ headers: { "USER-AGENT": "account", "x-codex-installation-id": "account-installation" } }))
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  const request = new Request(BASE + "/v1/responses", {
+    method: "POST",
+    headers: { "session-id": "request-session", "thread_id": "request-thread", "x-codex-turn-metadata": "request-turn" },
+    body: JSON.stringify({ client_metadata: {
+      session_id: "body-session", thread_id: "body-thread", "x-codex-turn-metadata": "body-turn",
+      "x-codex-window-id": "body-window", "x-codex-installation-id": "body-installation",
+    } }),
+  })
+  await loader.fetch(request, { headers: { "session-id": "init-session" } })
+  const headers = calls[0]
+  assert.equal(headers.get("user-agent"), "account")
+  assert.equal(headers.get("session-id"), "init-session")
+  assert.equal(headers.get("thread_id"), "request-thread")
+  assert.equal(headers.has("thread-id"), false)
+  assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
+  assert.equal(headers.get("x-codex-window-id"), "protocol-window")
+  assert.equal(headers.get("x-codex-installation-id"), "account-installation")
+})
+
+test("Codex body metadata is not promoted on other protocols or management endpoints", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  const body = JSON.stringify({ client_metadata: { "x-codex-window-id": "not-a-codex-request", session_id: "session" } })
+  for (const path of ["/v1/messages", "/v1/chat/completions", "/v1beta/models/gemini-test:generateContent", "/v1/models", "/v1/usage"]) {
+    await loader.fetch(BASE + path, { method: "POST", body })
+    assert.equal(calls.at(-1).headers.has("x-codex-window-id"), false)
+    assert.equal(calls.at(-1).headers.has("session-id"), false)
+    assert.equal(calls.at(-1).body, body)
+  }
+})
+
+test("missing malformed and unsafe metadata does not fail requests or leak arbitrary headers", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  for (const body of [
+    "", "{broken", "null", "[]", "{}", '{"client_metadata":[]}', '{"client_metadata":"not-an-object"}',
+    JSON.stringify({ client_metadata: {
+      "x-codex-window-id": 123,
+      "x-codex-installation-id": { value: "not-a-string" },
+      "x-codex-turn-metadata": "secret\r\nInjected: yes",
+      "x-codex-bad name": "secret",
+      "x-codex-empty": "",
+      "x-codex-nul": "secret\0",
+      "x-codex-unicode": "\u4e2d",
+      "x-codex-oversized": "x".repeat(8193),
+      "x-codex-reserved": undefined,
+      session_id: null,
+    } }),
+  ]) {
+    await loader.fetch(BASE + "/v1/responses", { method: "POST", body })
+    assert.equal(calls.at(-1).body, body)
+    assert.deepEqual([...calls.at(-1).headers.keys()].sort(), ["authorization", "user-agent"])
+  }
+})
+
+test("metadata inspection skips large or encoded bodies and streaming init.body uploads", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return json({}) })
+  const body = JSON.stringify({ client_metadata: { "x-codex-window-id": "window" }, padding: "x".repeat(1 << 20) })
+  for (const inputBody of [body, Buffer.from(body), new Blob([body])]) {
+    await loader.fetch(BASE + "/v1/responses", { method: "POST", body: inputBody })
+    assert.equal(calls.at(-1).init.body, inputBody)
+    assert.equal(calls.at(-1).init.headers.has("x-codex-window-id"), false)
+  }
+  const request = new Request(BASE + "/v1/responses", { method: "POST", body })
+  await loader.fetch(request)
+  assert.equal(calls.at(-1).input, request)
+  assert.equal(request.bodyUsed, false)
+  assert.equal(await request.text(), body)
+  assert.equal(calls.at(-1).init.headers.has("x-codex-window-id"), false)
+  const smallBody = '{"client_metadata":{"x-codex-window-id":"window"}}'
+  await loader.fetch(BASE + "/v1/responses", { method: "POST", body: smallBody, headers: { "content-encoding": "gzip" } })
+  assert.equal(calls.at(-1).init.headers.has("x-codex-window-id"), false)
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(smallBody)); controller.close() } })
+  await loader.fetch(BASE + "/v1/responses", { method: "POST", body: stream, duplex: "half" })
+  assert.equal(calls.at(-1).init.body, stream)
+  assert.equal(stream.locked, false)
+  assert.equal(calls.at(-1).init.headers.has("x-codex-window-id"), false)
+})
+
+test("metadata headers have a total size limit and small later values can still be copied", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let headers
+  t.mock.method(globalThis, "fetch", async (_, init) => { headers = init.headers; return json({}) })
+  const first = "x".repeat(5000)
+  await loader.fetch(BASE + "/v1/responses", {
+    method: "POST",
+    body: JSON.stringify({ client_metadata: { "x-codex-first": first, "x-codex-second": first, "x-codex-window-id": "window" } }),
+  })
+  assert.equal(headers.get("x-codex-first"), first)
+  assert.equal(headers.has("x-codex-second"), false)
+  assert.equal(headers.get("x-codex-window-id"), "window")
+})
+
+test("metadata Request inspection honors aborts and timeouts without consuming the original body", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let cancelInspection
+  t.mock.method(globalThis, "setTimeout", (callback) => { cancelInspection = callback; return 0 })
+  t.mock.method(globalThis, "clearTimeout", () => {})
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    calls.push({ input, init })
+    init.signal?.throwIfAborted()
+    return json({})
+  })
+  for (const kind of ["abort", "timeout"]) {
+    let streamController
+    const stream = new ReadableStream({ start(controller) { streamController = controller } })
+    const controller = new AbortController()
+    const request = new Request(BASE + "/v1/responses", { method: "POST", body: stream, duplex: "half" })
+    const pending = loader.fetch(request, { signal: controller.signal })
+    assert.equal(calls.length, kind === "abort" ? 0 : 1)
+    if (kind === "abort") {
+      controller.abort()
+      await assert.rejects(pending, { name: "AbortError" })
+    } else {
+      cancelInspection()
+      await pending
+    }
+    assert.equal(request.bodyUsed, false)
+    assert.equal(calls.at(-1).init.headers.has("x-codex-window-id"), false)
+    const body = '{"client_metadata":{"x-codex-window-id":"window"}}'
+    streamController.enqueue(new TextEncoder().encode(body))
+    streamController.close()
+    assert.equal(await request.text(), body)
+  }
+})
+
+test("Codex metadata is isolated between accounts and successive requests", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const first = await plugin.auth.loader(async () => auth({}, "sk-first"))
+  const second = await plugin.auth.loader(async () => auth({}, "sk-second"))
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  for (const [loader, session] of [[first, "first-session"], [second, "second-session"], [first, "new-first-session"]]) {
+    await loader.fetch(BASE + "/v1/responses", { method: "POST", body: JSON.stringify({ client_metadata: { session_id: session, "x-codex-window-id": session + ":0" } }) })
+  }
+  await first.fetch(BASE + "/v1/responses", { method: "POST", body: "{}" })
+  assert.deepEqual(calls.map((headers) => headers.get("session-id")), ["first-session", "second-session", "new-first-session", null])
+  assert.deepEqual(calls.map((headers) => headers.get("x-codex-window-id")), ["first-session:0", "second-session:0", "new-first-session:0", null])
+  assert.deepEqual(calls.map((headers) => headers.get("authorization")), ["Bearer sk-first", "Bearer sk-second", "Bearer sk-first", "Bearer sk-first"])
 })
 
 test("inference applies protocol-specific Codex and Claude headers", async (t) => {
@@ -451,6 +668,26 @@ test("real HTTP sends headers, preserves streaming, cancellation and refuses red
     assert.equal(call.headers["x-client"], "real-http")
     assert.equal(call.headers["user-agent"], "magpie-test")
   }
+  const automatic = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
+  const automaticLoader = await automatic.auth.loader(async () => account)
+  const body = JSON.stringify({ stream: true, client_metadata: {
+    session_id: "loopback-session", "x-codex-window-id": "loopback-session:0",
+    "x-codex-turn-metadata": JSON.stringify({ turn_id: "loopback-turn" }),
+  } })
+  const metadataRequest = new Request(base + "/v1/responses", { method: "POST", body, headers: { "User-Agent": "magpie/test" } })
+  const metadataResponse = await automaticLoader.fetch(metadataRequest)
+  assert.equal(await metadataResponse.text(), 'data: {"ok":true}\n\ndata: [DONE]\n\n')
+  assert.equal(calls.at(-1).path, "/openai/v1/responses")
+  assert.equal(calls.at(-1).body, body)
+  assert.equal(calls.at(-1).headers["user-agent"], "codex_cli_rs/0.146.0 (magpie-sub2api)")
+  assert.equal(calls.at(-1).headers["session-id"], "loopback-session")
+  assert.equal(calls.at(-1).headers["x-codex-window-id"], "loopback-session:0")
+  assert.equal(calls.at(-1).headers["x-codex-turn-metadata"], '{"turn_id":"loopback-turn"}')
+  assert.equal(calls.at(-1).headers.authorization, `Bearer ${account.key}`)
+  const claudeResponse = await automaticLoader.fetch(base + "/v1/messages", { method: "POST", body, headers: { "User-Agent": "magpie/test" } })
+  await claudeResponse.text()
+  assert.equal(calls.at(-1).headers["user-agent"], "anthropic-typescript (magpie-sub2api)")
+  assert.equal(calls.at(-1).headers["x-codex-window-id"], undefined)
   await assert.rejects(loader.fetch(base + "/v1/redirect"))
   assert.equal(calls.some((c) => c.path === "/v1/target"), false)
   const controller = new AbortController()

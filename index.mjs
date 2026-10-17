@@ -37,6 +37,8 @@ const PROTOCOL_USER_AGENTS = {
   gemini: "google-genai-sdk (magpie-sub2api)",
 }
 const TIMEOUT = 15_000
+const METADATA_BODY_MAX = 1 << 20
+const METADATA_HEADERS_MAX = 8 << 10
 const ICON_TIMEOUT = 3_000
 const ICON_MAX = 1 << 20
 const ICON_PAGE_MAX = 512 << 10
@@ -169,6 +171,65 @@ function modelProtocol(id, routing) {
   return "chat-completions"
 }
 
+async function metadataBody(input, init) {
+  const body = init?.body
+  if (typeof body === "string") return Buffer.byteLength(body) <= METADATA_BODY_MAX ? body : undefined
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    if (body.byteLength > METADATA_BODY_MAX) return
+    return new TextDecoder().decode(body)
+  }
+  if (body instanceof Blob) return body.size <= METADATA_BODY_MAX ? body.text() : undefined
+  // Do not consume streaming init.body uploads. A Request is inspected via a
+  // bounded clone so its original body remains available to fetch.
+  if (body !== undefined || !(input instanceof Request) || !input.body || input.bodyUsed) return
+  const signal = init?.signal ?? input.signal
+  if (signal?.aborted) return
+  const reader = input.clone().body.getReader()
+  const cancel = () => { reader.cancel().catch(() => {}) }
+  const timer = setTimeout(cancel, TIMEOUT)
+  signal?.addEventListener("abort", cancel, { once: true })
+  const chunks = []
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) return Buffer.concat(chunks, size).toString("utf8")
+      size += value.byteLength
+      if (size > METADATA_BODY_MAX) return
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener("abort", cancel)
+    cancel()
+    reader.releaseLock()
+  }
+}
+
+async function codexMetadataHeaders(input, init, headers) {
+  let metadata
+  try {
+    metadata = JSON.parse(await metadataBody(input, init))?.client_metadata
+  } catch {
+    return
+  }
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return
+  let size = 0
+  for (const [field, value] of Object.entries(metadata)) {
+    const name = field === "session_id" ? "session-id" : field === "thread_id" ? "thread-id" : field
+    if (!["session-id", "thread-id"].includes(name) && !/^x-codex-[!#$%&'*+.^_`|~0-9A-Za-z-]+$/i.test(name)) continue
+    if (headers.has(name) || headers.has(name.replace(/-/g, "_"))) continue
+    if (typeof value !== "string" || !value.trim()) continue
+    const length = name.length + value.length + 4
+    if (size + length > METADATA_HEADERS_MAX) continue
+    // Body metadata is untrusted too; ignore invalid values without logging them.
+    try {
+      for (const [key, val] of Object.entries(customHeaders({ [name]: value }))) headers.set(key, val)
+      size += length
+    } catch {}
+  }
+}
+
 function accountFetch(base, key, extra, routing, protocolExtra = {}) {
   // The host's loader baseURL overrides individual model URLs. Resolve the
   // protocol from its generated endpoint and route it to the configured path.
@@ -192,8 +253,11 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}) {
     if (protocol === "gemini") target.searchParams.delete("key")
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
-    // Preserve the host's identity; protocol defaults only fill a missing UA.
-    if (protocol && !headers.has("user-agent")) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
+    // Generic host identity must not override the selected protocol's identity.
+    if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
+    if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
+      await codexMetadataHeaders(input, init, headers)
+    }
     for (const [name, value] of Object.entries(protocolExtra[protocol] ?? {})) headers.set(name, value)
     for (const [name, value] of Object.entries(extra)) headers.set(name, value)
     headers.set("authorization", `Bearer ${key}`)

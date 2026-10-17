@@ -77,7 +77,7 @@ The same JSON can be entered in Magpie's plugin options editor. A site provider 
 
 Header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The final merged headers are enforced in the account's fetch function, so callers cannot override them. Values are literal; environment expansion and templates are not supported.
 
-Inference preserves the `User-Agent` supplied by Magpie. Only requests without that header receive a protocol-specific compatibility default (not the SDK version installed by the host):
+Inference sets a protocol-specific compatibility `User-Agent`, replacing Magpie's or the caller's UA, including an empty value. These identifiers are not the SDK versions installed by the host:
 
 | API protocol | Default `User-Agent` |
 | --- | --- |
@@ -86,9 +86,13 @@ Inference preserves the `User-Agent` supplied by Magpie. Only requests without t
 | `anthropic` | `anthropic-typescript (magpie-sub2api)` |
 | `gemini` | `google-genai-sdk (magpie-sub2api)` |
 
-Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Precedence is **protocol defaults < caller headers < global headers < site headers < account headers**, case-insensitively. A caller-supplied `User-Agent`, including an empty string, is preserved; explicitly configured values still take precedence. Remove any old override to use Magpie's UA, falling back to automatic selection only when absent. Usage, model discovery and Codex reasoning-level queries do not receive these defaults and keep their existing custom headers.
+Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. UA precedence is **caller UA < protocol default UA < protocolHeaders < global headers < site headers < account headers**, case-insensitively. Remove any old `User-Agent` override from ordinary `headers` to switch automatically by protocol; use `protocolHeaders.codex` / `protocolHeaders.claude` for separate explicit UAs. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these defaults and keep their existing custom headers.
 
-Except for authentication and HTTP transport-managed headers, inference forwards the caller's other request headers. Consequently, Codex's `originator`, `session-id` and all `x-codex-*` headers reach the key-and-URL provider unchanged; duplicate values in `init.headers` override `Request.headers`, while explicitly configured global, site or account headers still have higher precedence. These headers can contain client and session identifiers, so send them only to trusted providers.
+Except for plugin-managed fields such as UA and authentication, inference forwards the caller's other request headers. Codex's `originator`, `session-id` and all `x-codex-*` headers are preserved; duplicate values in `init.headers` override `Request.headers`, while explicitly configured protocol, global, site or account headers still have higher precedence.
+
+Responses requests also fill missing headers from the JSON body's `client_metadata`: `session_id` becomes `session-id`, `thread_id` becomes `thread-id`, and string-valued `x-codex-*` fields keep their names. Existing headers, including `session_id` / `thread_id` aliases, win. No other arbitrary fields are copied, no installation/window/session identifiers are generated, and the body is unchanged. This conversion does not apply to Claude, Chat Completions, Gemini or management endpoints.
+
+Metadata inspection supports strings, bytes, Blobs and a cloned `Request`, reading at most 1 MiB. Clone reads wait at most 15 seconds and honor cancellation. Direct `ReadableStream` uploads in `init.body`, encoded bodies and oversized bodies are passed to fetch without conversion; existing HTTP headers are still preserved. Invalid JSON or header values are ignored, and added metadata headers are capped at 8 KiB in total. These headers can contain client, session and local workspace information; send them only to trusted providers and remove unwanted metadata at the caller.
 
 These identifiers provide protocol compatibility; they do not make Magpie an official client or change account permissions. If `This account only allows Codex official clients` persists, the site may also validate request bodies or other client characteristics. Ask the administrator to allow compatible clients for the account, or use a supported official client.
 
