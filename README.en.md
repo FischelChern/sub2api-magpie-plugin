@@ -147,7 +147,7 @@ Every API-key sign-in is a separate account. Its `/v1/models` request uses that 
 
 ### Optional Filters and Metadata Overrides
 
-Without filters, every key model remains visible, with the additional Responses speed presets described below. `includeModels` and `excludeModels` are exact full-ID lists, applied only when explicitly configured. `includeModels: []` deliberately hides all models. `modelNames` changes display names, never wire model IDs:
+Without filters, every real key model remains visible, without additional speed models. `includeModels` and `excludeModels` are exact full-ID lists, applied only when explicitly configured. `includeModels: []` deliberately hides all models. `modelNames` changes display names, never wire model IDs:
 
 ```json
 {
@@ -167,41 +167,45 @@ Without filters, every key model remains visible, with the additional Responses 
 }
 ```
 
-Values are illustrative: use your site's actual capabilities and prices. Overrides apply only to models already returned for the key; they do not create permissions. Precedence is global < site < account metadata. Filter arrays replace earlier arrays, names merge per ID, and metadata overrides merge deeply. Allowed fields are `name`, `limit`, `cost`, `capabilities`, `options`, `headers`, `variants`, `release_date` and `status`, not model identity, API routing or credentials. Model headers obey reserved-header validation. Continue using `modelProtocols` for protocol overrides.
+Values are illustrative: use your site's actual capabilities and prices. Overrides apply only to models already returned for the key; they do not create permissions. Precedence is global < site < account metadata. Filter arrays replace earlier arrays, names merge per ID, and metadata overrides merge deeply. Allowed fields are `name`, `limit`, `cost`, `capabilities`, `options`, `headers`, `variants`, `release_date`, `status` and `serviceTiers`, not model identity, API routing or credentials. `serviceTiers` arrays replace earlier arrays. Model headers obey reserved-header validation. Continue using `modelProtocols` for protocol overrides.
 
-### Fast / Ultraspeed Presets
+### Select Fast / Ultraspeed On The Original Model
 
-The default `"speedModels": ["fast", "ultraspeed"]` generates two additional selectable presets for each Responses model while retaining the original. For an upstream `gpt-example`:
+The catalog contains only real IDs returned by the site. Supported service tiers reported for the current key are attached to each original model as `serviceTiers`. Magpie can offer them to agents that understand tier catalogs, such as compatible Codex versions. No `-fast` / `-ultraspeed` models are generated, and model IDs, display names, reasoning levels and default speeds stay unchanged.
 
-| Selected Magpie model ID | Upstream `model` | Upstream speed parameter |
+| Agent selection | OpenAI-compatible request parameter | Upstream model ID |
 | --- | --- | --- |
-| `gpt-example` | `gpt-example` | Client parameters unchanged |
-| `gpt-example-fast` | `gpt-example` | `service_tier: "priority"` |
-| `gpt-example-ultraspeed` | `gpt-example` | `service_tier: "ultrafast"` |
+| Normal / default | No additional speed parameter | `gpt-example` |
+| Fast | `service_tier: "priority"` | `gpt-example` |
+| Ultraspeed / Ultrafast | `service_tier: "ultrafast"` | `gpt-example` |
 
-Configuration uses **`fast` / `ultraspeed`**; the OpenAI-compatible wire values are **`priority` / `ultrafast`**. `ultraspeed` is not appended to the upstream model name or sent as a wire tier. Display names add `(fast)` / `(ultraspeed)` for clarity and can be customized with `modelNames`; `api.id` always remains the original model ID.
+For example, an agent selects Fast while calling `sub2api/gpt-example` through Magpie:
 
-Array configuration applies automatically only to Responses models. To target individual models, or explicitly enable a site's supported Chat Completions / Anthropic acceleration, use an object keyed by original model IDs:
+```json
+{"model":"sub2api/gpt-example","input":"hello","service_tier":"priority"}
+```
+
+After Magpie selects an account, the upstream model is `gpt-example`, with `priority` unchanged. `ultraspeed` is a configuration alias: the wire value is `ultrafast`, not `service_tier: "ultraspeed"`.
+
+- **Only evidence-backed capabilities are advertised.** The current key's `/v1/models` supplies `service_tiers` / `serviceTiers`, accepting strings or objects such as `{ "id": "priority" }`. For catalogs containing Responses models, absent fields can be supplemented by the same key's `/backend-api/codex/models`. An explicit empty array, `null` or malformed primary value is not filled back in from the optional manifest.
+- Missing speed metadata is not inferred from a GPT name, subscription label, protocol or another key's host metadata. No billable capability probes are sent. An unavailable optional manifest does not hide the model, but its previous tiers are not reused as current capabilities. Site-reported capabilities still cannot replace upstream authorization checks.
+- If metadata is missing but you have verified a key's support, declare it explicitly on the original model. This configuration also works in site options or account `metadata`; prefer account-level overrides when keys have different eligibility for the same model:
 
 ```json
 {
-  "speedModels": {
-    "gpt-example": ["fast", "ultraspeed"],
-    "my-chat-alias": ["fast"],
-    "claude-example": ["fast"]
+  "modelOverrides": {
+    "gpt-example": {"serviceTiers": ["priority", "ultrafast"]}
   }
 }
 ```
 
-- Object mode targets only listed models; `"speedModels": []` disables all generation. Precedence is global < site < account `metadata.speedModels`. Arrays replace; consecutive objects merge per model; an empty array disables that model's presets. Set protocol aliases through `modelProtocols` as before.
-- Anthropic Fast sends `speed: "fast"` without inventing billing-related beta headers. If your site requires a beta header, configure `protocolHeaders.claude` according to its documentation. Anthropic Ultraspeed and Gemini presets are not implemented and explicit configuration fails rather than pretending support.
-- **Presets are request configurations, not proof of key eligibility or guaranteed acceleration.** `/v1/models` usually does not report tier access. Unsupported tiers return the upstream error, without trying the original model, another key, a lower speed or a different model. The plugin cannot prevent an upstream server from ignoring parameters.
-- Every preset comes from a real model listed for the current key and uses that account's Base URL, key and protocol path. Magpie's `chat.headers` hook carries the selection to the account transport; the private marker is removed before sending. The transport enforces the selected tier even if the host previously downgraded it. Requests without a speed preset are not rewritten.
-- A real upstream ID takes precedence over a generated ID collision. Generated models are not recursively expanded. `includeModels` / `excludeModels` also match generated IDs exactly; use `speedModels: []` to hide all speed presets.
-- Presets preserve original limits, capabilities and reasoning levels, but **do not inherit base-tier prices**. Configure actual prices through entries such as `modelOverrides.gpt-example-fast.cost`; absent prices remain unknown, not free.
-- Ordinary requests and response streams remain unchanged; presets rewrite only JSON model/speed fields. Direct streaming uploads or Request bodies that cannot be safely inspected fail explicitly instead of silently dropping the speed choice. Request inspection is bounded to 1 MiB.
-
-Disable Magpie's own account retries, routing groups and fallback models separately if you need end-to-end no-fallback behavior. The plugin never rewrites host routing configuration.
+- `serviceTiers` declares capability without enabling speed by default. An empty array explicitly hides it. Configuration aliases `fast` and `ultraspeed` normalize to `priority` and `ultrafast`. Precedence is global < site < account; arrays replace. Declarations neither add unlisted models nor grant real permissions.
+- This mechanism targets Responses / Chat Completions `service_tier`. Native Anthropic `speed: "fast"` requests still pass through unchanged, but Anthropic and Gemini are not advertised as supporting OpenAI service tiers. Explicit nonempty `serviceTiers` on these protocols fails. If a site serves such a model over an OpenAI-compatible API, set `modelProtocols` accordingly.
+- Each request uses its selected account's Base URL, key and protocol path. The plugin does not rewrite the agent's model or speed, inject a default tier or pre-read response streams. Unsupported tiers return the original upstream error without downgrading, retrying or changing keys/models.
+- Magpie must support plugin `serviceTiers`, and the agent must understand the catalog and send the corresponding parameter. Not every client automatically gains a speed menu; clients without one can set standard request fields themselves. The host may translate parameters or apply account retries/fallbacks before the plugin sees a request. Disable those host policies separately for end-to-end no-fallback behavior; this plugin never changes them.
+- After upgrading, reload the plugin and model catalog. Replace old synthetic-model selections, filters, prices or routing references with the original model. Cached synthetic-model selectors fail explicitly instead of silently dropping the requested speed. Real upstream IDs that happen to end in `-fast` or similar remain valid.
+- Legacy `speedModels` no longer creates models: arrays only filter reported acceleration tiers and cannot invent support; objects remain compatible as per-original-ID capability declarations. Migrate to `modelOverrides.<original-id>.serviceTiers`. Defaults and examples no longer include this legacy option.
+- Original price and usage metadata remain intact. Speed can affect billing: if the host estimates all tiers with one model price, do not treat that estimate as the actual accelerated-tier bill. Follow the site's pricing and actual usage.
 
 ## Query Performance and Diagnostics
 
@@ -256,7 +260,7 @@ npm test
 npm pack --dry-run
 ```
 
-Tests require no dependencies, Docker or credentials. They cover usage conversion, full paginated catalogs, metadata preservation, header precedence, account isolation, all four conversational protocols, explicit aliases, path rewriting, authentication, URL checks, no-fallback failures, query caching/size/time limits and icon isolation. Speed tests verify unchanged wire model IDs, tier mapping, concurrency, prices, ID collisions, filters and no-downgrade failures. Metric tests preserve JSON/SSE usage, cache and reasoning tiers without pre-reading streams or fabricating free prices. Loopback HTTP tests check matching multi-key destinations/credentials, speed requests, actual headers, SSE, cancellation, icon fetching and redirect rejection; they explicitly skip if local listening is prohibited. CI runs checks, tests and package previews on Linux/macOS with Node.js 20/22/24.
+Tests require no dependencies, Docker or credentials. They cover usage conversion, full paginated catalogs, metadata preservation, header precedence, account isolation, all four conversational protocols, explicit aliases, path rewriting, authentication, URL checks, no-fallback failures, query caching/size/time limits and icon isolation. Speed tests verify no synthetic models, per-key tier discovery, metadata precedence, no inferred eligibility, unchanged native parameters, concurrency and legacy-selector migration. Metric tests preserve JSON/SSE usage, cache and reasoning tiers without pre-reading streams or fabricating free prices. Loopback HTTP tests check matching multi-key destinations/credentials, original-model speed selection, actual headers, SSE, cancellation, icon fetching and redirect rejection; they explicitly skip if local listening is prohibited. CI runs checks, tests and package previews on Linux/macOS with Node.js 20/22/24.
 
 These tests do not replace live Magpie/Sub2API integration. Verify usage, model discovery and a model request in Magpie against your own site. Inspect custom headers only in logs you control, without logging credentials.
 

@@ -53,7 +53,7 @@ const QUERY_DEFAULTS = {
   maxResponseBytes: 4 << 20,
 }
 const CACHE_MAX = 128
-const SPEED_HEADER = "x-sub2api-magpie-plugin-speed-model"
+const LEGACY_SPEED_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
 
 const HOUR = 3600
@@ -129,7 +129,7 @@ const RESERVED_HEADERS = new Set([
   "authorization", "proxy-authorization", "x-api-key", "x-goog-api-key",
   "host", "content-length", "connection", "transfer-encoding", "upgrade",
   "keep-alive", "te", "trailer", "proxy-connection", "accept-encoding",
-  SPEED_HEADER,
+  ...LEGACY_SPEED_HEADERS,
 ])
 
 function customHeaders(value) {
@@ -243,7 +243,7 @@ function mergeModel(...values) {
 }
 
 function modelSettings(...layers) {
-  const out = { includeModels: undefined, excludeModels: [], modelNames: {}, modelOverrides: {}, speedModels: ["fast", "ultraspeed"] }
+  const out = { includeModels: undefined, excludeModels: [], modelNames: {}, modelOverrides: {}, speedModels: undefined }
   for (const layer of layers) {
     if (!layer) continue
     if (layer.speedModels !== undefined) {
@@ -278,11 +278,14 @@ function modelSettings(...layers) {
           out.modelNames[id] = value
         } else {
           if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("modelOverrides requires model metadata objects")
-          if (Object.keys(value).some((key) => !["name", "limit", "cost", "capabilities", "options", "headers", "variants", "release_date", "status"].includes(key))) {
+          if (Object.keys(value).some((key) => !["name", "limit", "cost", "capabilities", "options", "headers", "variants", "release_date", "status", "serviceTiers"].includes(key))) {
             throw new Error("modelOverrides cannot change model identity, credentials or API routing")
           }
           for (const key of ["limit", "cost", "capabilities", "options", "headers", "variants"]) {
             if (value[key] !== undefined && (!value[key] || typeof value[key] !== "object" || Array.isArray(value[key]))) throw new Error("Model metadata fields must be objects")
+          }
+          if (value.serviceTiers !== undefined && (!Array.isArray(value.serviceTiers) || value.serviceTiers.length > 64 || value.serviceTiers.some((tier) => typeof tier !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(tier)))) {
+            throw new Error("Model serviceTiers must be an array of valid service tier IDs")
           }
           if (value.options && ["apiKey", "baseURL", "baseUrl", "headers", "fetch"].some((key) => Object.hasOwn(value.options, key))) throw new Error("Model options cannot override account credentials or routing")
           for (const field of ["name", "status", "release_date"]) {
@@ -305,15 +308,44 @@ function modelSettings(...layers) {
   return out
 }
 
-function speedProfiles(model, protocol, selection) {
-  // Defaults are request presets for Responses, not a promise of key eligibility.
-  const speeds = Array.isArray(selection.speedModels)
-    ? protocol === "responses" ? selection.speedModels : []
-    : selection.speedModels[model] ?? []
-  if (speeds.length && (protocol === "gemini" || (protocol === "anthropic" && speeds.includes("ultraspeed")))) {
-    throw new Error("This protocol does not support the configured model speed")
+function serviceTiers(value) {
+  if (!Array.isArray(value)) return []
+  const out = new Set()
+  for (const tier of value.slice(0, 64)) {
+    const raw = typeof tier === "string" ? tier : tier?.id
+    if (typeof raw !== "string") continue
+    const name = raw.trim().toLowerCase()
+    const id = Object.hasOwn(SPEEDS, name) ? SPEEDS[name] : name
+    if (/^[a-z][a-z0-9_-]{0,63}$/.test(id)) out.add(id)
   }
-  return speeds
+  return [...out]
+}
+
+function reportedTiers(model) {
+  for (const field of ["service_tiers", "serviceTiers"]) {
+    if (model && Object.hasOwn(model, field)) return serviceTiers(model[field])
+  }
+}
+
+function modelServiceTiers(model, manifest, selection, protocol) {
+  const configured = selection.modelOverrides[model.id]?.serviceTiers
+  const legacy = selection.speedModels
+  const legacyConfigured = legacy && !Array.isArray(legacy) && Object.hasOwn(legacy, model.id)
+  const declared = configured ?? (legacyConfigured ? legacy[model.id] : undefined)
+  let tiers = serviceTiers(declared ?? reportedTiers(model) ?? manifest?.serviceTiers)
+  // Native service_tier selection is supported on OpenAI-compatible APIs.
+  // Never borrow account eligibility from the host's merged model metadata.
+  if (!["responses", "chat-completions"].includes(protocol)) {
+    if (tiers.length && declared !== undefined) {
+      throw new Error("Service tier selection requires an OpenAI-compatible API protocol")
+    }
+    return []
+  }
+  if (Array.isArray(legacy)) {
+    const allowed = legacy.map((speed) => SPEEDS[speed])
+    tiers = tiers.filter((tier) => !Object.values(SPEEDS).includes(tier) || allowed.includes(tier))
+  }
+  return tiers
 }
 
 function validatePrices(selection) {
@@ -412,35 +444,17 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     report("inference.route", { protocol: protocol ?? "unknown" })
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
-    const marker = headers.get(SPEED_HEADER)
-    headers.delete(SPEED_HEADER)
+    if (LEGACY_SPEED_HEADERS.some((header) => headers.has(header))) {
+      throw new Error("Legacy speed models are no longer supported; refresh the model catalog and select speed on the original model")
+    }
     const body = init?.body
     let payload
-    // Leave ordinary streaming uploads untouched. A speed preset must be
-    // inspectable so it cannot silently run at the wrong model or tier.
-    if (marker || (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)))) {
+    // Inspect only readily available JSON for membership; never consume a
+    // streaming upload or rewrite the agent's model/service_tier selection.
+    if (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body))) {
       try {
-        const text = typeof body === "string" ? body
-          : body instanceof ArrayBuffer || ArrayBuffer.isView(body) ? new TextDecoder().decode(body)
-          : await metadataBody(input, init)
-        payload = JSON.parse(text)
+        payload = JSON.parse(await metadataBody(input, init))
       } catch {}
-    }
-    let selected
-    if (marker) {
-      try { selected = state?.speedAliases?.get(decodeURIComponent(marker)) } catch {}
-      if (!selected) throw new Error("The selected speed model is not listed for this Sub2API account")
-    } else if (typeof payload?.model === "string") selected = state?.speedAliases?.get(payload.model)
-    if (selected) {
-      if (!payload || (payload.model !== selected.id && payload.model !== selected.model)) throw new Error("The speed preset does not match the requested model")
-      if (protocol !== selected.protocol) throw new Error("The speed preset does not match the requested API protocol")
-      if (headers.has("content-encoding") && headers.get("content-encoding") !== "identity") throw new Error("Speed presets require an uncompressed JSON request")
-      payload.model = selected.model
-      if (protocol === "anthropic") payload.speed = "fast"
-      else payload.service_tier = SPEEDS[selected.speed]
-      init = { ...init, body: JSON.stringify(payload) }
-      headers.delete("content-length")
-      if (!headers.has("content-type")) headers.set("content-type", "application/json")
     }
     if (state?.ids && typeof payload?.model === "string" && !state.ids.has(payload.model)) {
       throw new Error("The selected model is not listed for this Sub2API account")
@@ -739,7 +753,8 @@ function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   out.id = m.id
   out.providerID = providerID
   out.api = { id: m.id, url, npm }
-  delete out.headers[SPEED_HEADER]
+  for (const header of LEGACY_SPEED_HEADERS) delete out.headers[header]
+  delete out.fast
   out.name = override.name ?? (m.named ? m.name : was?.name ?? m.name)
   if (told?.length && override.variants === undefined) out.variants = variantsOf(told)
   if (override.variants !== undefined) out.variants = mergeModel(override.variants)
@@ -747,14 +762,9 @@ function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   return out
 }
 
-// efforts are each model's reasoning levels, by id, as the site's Codex
-// models manifest tells them ({models: [{slug, supported_reasoning_levels:
-// [{effort}, …] or ["low", …]}]}); the plain /v1/models never tells them.
-// The manifest is asked without a client_version, so the site asks its
-// upstream as the Codex version it keeps. Only a help: a site that can't
-// tell is no levels. sub2api lists a model it knows nothing of as ["none"]
-// alone, which tells no levels either; "none" next to others is one.
-async function efforts(query, base, key, extra, settings, report) {
+// The optional Codex manifest supplies per-key reasoning levels and service
+// tiers. Missing levels must not hide tier-only entries (and vice versa).
+async function codexModels(query, base, key, extra, settings, report) {
   let body
   try {
     body = await query(base, "/backend-api/codex/models", key, extra, settings, report, "efforts")
@@ -763,13 +773,16 @@ async function efforts(query, base, key, extra, settings, report) {
   }
   const out = Object.create(null)
   for (const m of Array.isArray(body?.models) ? body.models : []) {
-    if (typeof m?.slug !== "string" || !Array.isArray(m.supported_reasoning_levels)) continue
+    if (typeof m?.slug !== "string" || !m.slug) continue
     const levels = []
-    for (const l of m.supported_reasoning_levels) {
+    for (const l of Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels : []) {
       const e = typeof l === "string" ? l : l?.effort
       if (typeof e === "string" && e.trim() && !levels.includes(e.trim())) levels.push(e.trim())
     }
-    if (levels.some((l) => l !== "none")) out[m.slug] = levels
+    out[m.slug] = {
+      levels: levels.some((l) => l !== "none") ? levels : undefined,
+      serviceTiers: reportedTiers(m),
+    }
   }
   return out
 }
@@ -805,35 +818,18 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
     } else path = undefined
   }
   const told = entries.some((m) => typeof m?.id === "string" && modelProtocol(m.id, routing) === "responses")
-    ? await efforts(query, base, auth.key, extra, settings, report) : {}
+    ? await codexModels(query, base, auth.key, extra, settings, report) : {}
   const out = Object.create(null)
-  const upstreamIds = new Set(entries.map((m) => m?.id).filter((id) => typeof id === "string" && id))
   for (const m of entries) {
     if (typeof m?.id !== "string" || !m.id) continue
+    if ((selection.includeModels && !selection.includeModels.includes(m.id)) || selection.excludeModels.includes(m.id)) continue
     const display = selection.modelNames[m.id] ?? m.display_name ?? m.name
     const named = typeof display === "string" && !!display
     const name = named ? display : m.id
     const protocol = modelProtocol(m.id, routing)
-    out[m.id] = runtimeModel({ id: m.id, name, named }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id], was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
+    out[m.id] = runtimeModel({ id: m.id, name, named }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
     if (selection.modelNames[m.id]) out[m.id].name = selection.modelNames[m.id]
-    for (const speed of speedProfiles(m.id, protocol, selection)) {
-      const alias = m.id + "-" + speed
-      // An actual upstream ID always wins, even when it is filtered out later.
-      if (upstreamIds.has(alias)) { report("models.speed_collision"); continue }
-      const override = selection.modelOverrides[alias] ?? {}
-      const preset = mergeModel(out[m.id], override)
-      if (override.variants !== undefined) preset.variants = mergeModel(override.variants)
-      preset.id = alias
-      preset.name = selection.modelNames[alias] ?? override.name ?? `${out[m.id].name} (${speed})`
-      preset.headers[SPEED_HEADER] = encodeURIComponent(alias)
-      // Base-tier prices cannot safely price accelerated requests.
-      for (const field of ["cost", "free", "rate"]) delete preset[field]
-      if (override.cost) preset.cost = mergeModel(override.cost)
-      out[alias] = preset
-    }
-  }
-  for (const model of Object.keys(out)) {
-    if ((selection.includeModels && !selection.includeModels.includes(model)) || selection.excludeModels.includes(model)) delete out[model]
+    out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
   }
   report("models.ready", { discovered: entries.length, visible: Object.keys(out).length })
   return out
@@ -1080,8 +1076,12 @@ function hooks(client, id, site, options) {
   return {
     auth: authHook,
     "chat.headers": async ({ model }, output) => {
-      if (model?.providerID !== id || !model.headers?.[SPEED_HEADER]) return
-      output.headers[SPEED_HEADER] = model.headers[SPEED_HEADER]
+      // Carry only obsolete selectors so cached pre-migration models fail
+      // explicitly in fetch instead of silently losing their chosen speed.
+      if (model?.providerID !== id) return
+      for (const header of LEGACY_SPEED_HEADERS) {
+        if (model.headers?.[header]) output.headers[header] = model.headers[header]
+      }
     },
     // the key's group's list, asked of the account's site
     provider: {
@@ -1102,13 +1102,7 @@ function hooks(client, id, site, options) {
         try {
           const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report)
           expired.delete(scope)
-          const speedAliases = new Map()
-          for (const model of Object.values(found)) {
-            if (!model.headers?.[SPEED_HEADER]) continue
-            const speed = Object.keys(SPEEDS).find((speed) => model.id === model.api.id + "-" + speed)
-            if (speed) speedAliases.set(model.id, { id: model.id, model: model.api.id, speed, protocol: modelProtocol(model.api.id, routing) })
-          }
-          cacheSet(catalogs, catalogKey, { ids: new Set(Object.values(found).map((model) => model.api.id)), speedAliases })
+          cacheSet(catalogs, catalogKey, { ids: new Set(Object.keys(found)) })
           return found
         } catch (e) {
           cacheSet(catalogs, catalogKey, { error: e })

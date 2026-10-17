@@ -54,6 +54,5 @@
   },
   "modelNames": {},
   "modelOverrides": {},
-  "speedModels": ["fast", "ultraspeed"],
   "excludeModels": []
 }
