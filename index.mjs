@@ -449,15 +449,32 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     }
     const body = init?.body
     let payload
-    // Inspect only readily available JSON for membership; never consume a
-    // streaming upload or rewrite the agent's model/service_tier selection.
-    if (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body))) {
+    // Never consume streaming init.body uploads; Request inspection uses a bounded clone.
+    if (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
       try {
         payload = JSON.parse(await metadataBody(input, init))
       } catch {}
     }
     if (state?.ids && typeof payload?.model === "string" && !state.ids.has(payload.model)) {
-      throw new Error("The selected model is not listed for this Sub2API account")
+      const match = /^(.*)-(fast|ultraspeed|ultrafast)$/.exec(payload.model)
+      const original = match?.[1]
+      const tier = match?.[2] === "fast" ? "priority" : "ultrafast"
+      if (!original || !state.ids.has(original)) {
+        throw new Error("The selected model is not listed for this Sub2API account; refresh the model catalog and select an exact upstream model ID")
+      }
+      if (!["responses", "chat-completions"].includes(protocol) || !state.tiers?.get(original)?.includes(tier)) {
+        throw new Error("Legacy speed model cannot be migrated: this account has not declared the requested service tier; select the original model and verify its serviceTiers")
+      }
+      if (payload.service_tier !== undefined && payload.service_tier !== tier) {
+        throw new Error("Legacy speed model conflicts with the explicit service_tier; select the original model and one service tier")
+      }
+      if (headers.has("content-encoding") && headers.get("content-encoding") !== "identity") {
+        throw new Error("Legacy speed model cannot be migrated in an encoded request; select the original model and service tier")
+      }
+      // Compatibility normalization before the only upstream attempt, never a retry.
+      init = { ...init, body: JSON.stringify({ ...payload, model: original, service_tier: tier }) }
+      headers.delete("content-length")
+      report("inference.speed_migrated", { protocol })
     }
     // Generic host identity must not override the selected protocol's identity.
     if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
@@ -1109,7 +1126,10 @@ function hooks(client, id, site, options) {
         try {
           const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report)
           expired.delete(scope)
-          cacheSet(catalogs, catalogKey, { ids: new Set(Object.keys(found)) })
+          cacheSet(catalogs, catalogKey, {
+            ids: new Set(Object.keys(found)),
+            tiers: new Map(Object.entries(found).map(([model, metadata]) => [model, [...metadata.serviceTiers]])),
+          })
           return found
         } catch (e) {
           cacheSet(catalogs, catalogKey, { error: e })

@@ -300,8 +300,111 @@ test("cached old speed-model selectors fail rather than silently running the ori
     await assert.rejects(loader.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"gpt-test"}', headers: output.headers }), /Legacy speed models/)
     await assert.rejects(Sub2apiPlugin({}, { headers: { [header]: "private-value" } }), /reserved/)
   }
-  await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-test-fast"}' }), /not listed/)
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-test-fast"}' }), /has not declared/)
   assert.equal(requests.length, 0)
+})
+
+test("legacy speed IDs normalize to a listed original and supported tier before one upstream attempt", async (t) => {
+  const response = new Response("upstream rejected", { status: 429 })
+  const { requests } = mockAPI(t, {
+    entries: [{ id: "gpt-6.1-sol", service_tiers: ["priority", "ultrafast"] }],
+    reply: () => response,
+  })
+  const plugin = await Sub2apiPlugin()
+  const found = await plugin.provider.models(provider, { auth: account() })
+  assert.deepEqual(Object.keys(found), ["gpt-6.1-sol"])
+  const loader = await plugin.auth.loader(async () => account())
+  const controller = new AbortController()
+  for (const [suffix, tier] of [["fast", "priority"], ["ultraspeed", "ultrafast"], ["ultrafast", "ultrafast"]]) {
+    const payload = { model: "gpt-6.1-sol-" + suffix, input: "hello", stream: true, reasoning: { effort: "high" } }
+    const result = await loader.fetch(BASE + "/v1/responses", {
+      method: "POST", body: JSON.stringify(payload), signal: controller.signal, headers: { "content-type": "application/json", "content-length": "999" },
+    })
+    assert.equal(result, response)
+    assert.deepEqual(JSON.parse(requests.at(-1).init.body), { ...payload, model: "gpt-6.1-sol", service_tier: tier })
+    assert.equal(requests.at(-1).init.signal, controller.signal)
+    assert.equal(requests.at(-1).headers.get("authorization"), "Bearer speed-test-key")
+    assert.equal(requests.at(-1).headers.has("content-length"), false)
+  }
+  assert.equal(requests.length, 3)
+})
+
+test("legacy speed migration handles binary, Blob and Request bodies without consuming originals", async (t) => {
+  const { requests } = mockAPI(t, { entries: [{ id: "chat-model", service_tiers: ["priority"] }] })
+  const plugin = await Sub2apiPlugin()
+  await plugin.provider.models(provider, { auth: account() })
+  const loader = await plugin.auth.loader(async () => account())
+  const json = JSON.stringify({ model: "chat-model-fast", service_tier: "priority", messages: [] })
+  for (const body of [new TextEncoder().encode(json), new TextEncoder().encode(json).buffer, new Blob([json])]) {
+    await loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body })
+    assert.equal(JSON.parse(requests.at(-1).init.body).model, "chat-model")
+  }
+  const request = new Request(BASE + "/v1/chat/completions", { method: "POST", body: json })
+  await loader.fetch(request)
+  assert.equal(JSON.parse(requests.at(-1).init.body).model, "chat-model")
+  assert.equal(request.bodyUsed, false)
+  assert.equal(await request.text(), json)
+})
+
+test("real speed-suffixed IDs take precedence and unsupported migrations never send", async (t) => {
+  const { requests } = mockAPI(t, { entries: [
+    { id: "gpt-test", service_tiers: ["priority"] }, "gpt-test-fast", "gpt-unknown", "claude-test",
+  ] })
+  const plugin = await Sub2apiPlugin()
+  const found = await plugin.provider.models(provider, { auth: account() })
+  const loader = await plugin.auth.loader(async () => account())
+  const body = '{"model":"gpt-test-fast"}'
+  await loader.fetch(BASE + "/v1/responses", { method: "POST", body })
+  assert.equal(requests[0].init.body, body)
+  for (const [model, service_tier, error] of [
+    ["gpt-test-ultraspeed", undefined, /has not declared/],
+    ["gpt-unknown-fast", undefined, /has not declared/],
+    ["gpt-missing-fast", undefined, /not listed/],
+    ["claude-test-fast", undefined, /has not declared/],
+    ["gpt-test-ultraspeed", "priority", /has not declared/],
+  ]) {
+    await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: JSON.stringify({ model, service_tier }) }), error)
+  }
+  found["gpt-unknown"].serviceTiers.push("priority")
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-unknown-fast"}' }), /has not declared/)
+  assert.equal(requests.length, 1)
+})
+
+test("migration rejects tier conflicts, wrong protocols and encoded bodies and isolates account support", async (t) => {
+  const { requests } = mockAPI(t, { entries: (call) => [{ id: "gpt-test", service_tiers: call.headers.get("authorization") === "Bearer key-a" ? ["priority", "ultrafast"] : [] }] })
+  const plugin = await Sub2apiPlugin()
+  await plugin.provider.models(provider, { auth: account("key-a") })
+  await plugin.provider.models(provider, { auth: account("key-b") })
+  const a = await plugin.auth.loader(async () => account("key-a"))
+  const b = await plugin.auth.loader(async () => account("key-b"))
+  const body = '{"model":"gpt-test-fast"}'
+  await assert.rejects(a.fetch(BASE + "/v1/responses", { body: '{"model":"gpt-test-fast","service_tier":"ultrafast"}' }), /conflicts/)
+  await assert.rejects(a.fetch(BASE + "/v1/messages", { body }), /has not declared/)
+  await assert.rejects(a.fetch(BASE + "/v1/responses", { body, headers: { "content-encoding": "gzip" } }), /encoded/)
+  await assert.rejects(b.fetch(BASE + "/v1/responses", { body }), /has not declared/)
+  assert.equal(requests.length, 0)
+  await a.fetch(BASE + "/v1/responses", { body })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].headers.get("authorization"), "Bearer key-a")
+})
+
+test("migration never retries network errors or borrows stale tiers after refresh", async (t) => {
+  let tiers = ["priority"]
+  const { requests } = mockAPI(t, {
+    entries: () => [{ id: "gpt-test", service_tiers: tiers }],
+    reply: () => { throw new Error("upstream network failure") },
+  })
+  const plugin = await Sub2apiPlugin({}, { query: { modelsTtlMs: 0 } })
+  await plugin.provider.models(provider, { auth: account() })
+  const loader = await plugin.auth.loader(async () => account())
+  const body = '{"model":"gpt-test-fast"}'
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { body }), /upstream network failure/)
+  assert.equal(requests.length, 1)
+  assert.equal(JSON.parse(requests[0].init.body).model, "gpt-test")
+  tiers = []
+  await plugin.provider.models(provider, { auth: account() })
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { body }), /has not declared/)
+  assert.equal(requests.length, 1)
 })
 
 test("manifest failures do not reuse stale speed support or hide available models", async (t) => {
