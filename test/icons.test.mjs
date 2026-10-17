@@ -212,11 +212,11 @@ test("site and pooled provider icons remain isolated", async (t) => {
   assert.deepEqual(data(first.auth.icon), PNG)
 })
 
-test("icon failures and invalid auth do not prevent model discovery or fallback", async (t) => {
+test("icon failures do not prevent discovery and invalid auth cannot inherit a model list", async (t) => {
   const { icons } = mockSite(t, () => { throw new Error("unavailable") })
   const plugin = await Sub2apiPlugin()
   const previous = { previous: {} }
-  assert.equal(await plugin.provider.models({ models: previous }), previous)
+  assert.deepEqual(await plugin.provider.models({ models: previous }), {})
   assert.equal(icons.length, 0)
   const models = await plugin.provider.models({ models: {} }, { auth: account() })
   assert.ok(models["relay-model"])
@@ -260,6 +260,7 @@ test("real HTTP icon discovery keeps API credentials off public requests and ref
   const plugin = await Sub2apiPlugin({}, { headers: { "X-Global": "private" } })
   const models = await plugin.provider.models({ models: {} }, { auth: account(base) })
   assert.ok(models["relay-model"])
+  await plugin.config({})
   assert.deepEqual(data(plugin.auth.icon), PNG)
   assert.equal(calls.some((c) => c.path === "/should-not-be-fetched"), false)
   for (const call of calls.filter((c) => !c.path.includes("/v1/") && !c.path.includes("/backend-api/"))) {

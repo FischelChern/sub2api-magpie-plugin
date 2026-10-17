@@ -578,7 +578,7 @@ test("usage maps subscription windows, expiry and rolling weekly reset", async (
 })
 
 test("usage handles balance, quota, expired, unlimited and missing subscriptions", async (t) => {
-  const plugin = await plugins.Sub2apiPlugin()
+  const plugin = await plugins.Sub2apiPlugin({}, { query: { usageTtlMs: 0 } })
   const cases = [
     [{ planName: "Wallet", balance: 0 }, (u) => { assert.equal(u.plan, "Wallet"); assert.equal(u.balance, "$0.00") }],
     [{ balance: -1.25 }, (u) => assert.equal(u.balance, "$-1.25")],
@@ -600,7 +600,7 @@ test("usage handles balance, quota, expired, unlimited and missing subscriptions
   assert.match((await plugin.auth.usage(async () => ({ type: "api", key: "key" }))).error, /address/)
 })
 
-test("401 marks sign-in as expired, other model failures preserve the previous catalog", async (t) => {
+test("401 marks sign-in as expired and other model failures propagate without fallback", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   t.mock.method(globalThis, "fetch", async () => json({ error: { message: "invalid key" } }, 401))
   const usage = await plugin.auth.usage(async () => auth())
@@ -609,19 +609,19 @@ test("401 marks sign-in as expired, other model failures preserve the previous c
   t.mock.restoreAll()
   t.mock.method(globalThis, "fetch", async () => new Response("unavailable", { status: 503 }))
   const previous = { old: { id: "old" } }
-  assert.equal(await plugin.provider.models({ models: previous }, { auth: auth() }), previous)
+  await assert.rejects(plugin.provider.models({ models: previous }, { auth: auth() }), /503/)
   assert.equal((await plugin.auth.usage(async () => auth())).signIn, undefined)
 })
 
-test("manifest failures retain known reasoning levels and malformed model lists fall back", async (t) => {
-  const plugin = await plugins.Sub2apiPlugin()
+test("manifest failures retain known reasoning levels but malformed model lists fail explicitly", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, { query: { modelsTtlMs: 0 } })
   const previous = { "gpt-test": { variants: { medium: {}, high: {} } } }
   t.mock.method(globalThis, "fetch", async (url) => String(url).includes("backend-api") ? json({}, 404) : json(modelList))
   const models = await plugin.provider.models({ models: previous }, { auth: auth() })
   assert.deepEqual(models["gpt-test"].variants, previous["gpt-test"].variants)
   t.mock.restoreAll()
   t.mock.method(globalThis, "fetch", async () => json({ data: {} }))
-  assert.equal(await plugin.provider.models({ models: previous }, { auth: auth() }), previous)
+  await assert.rejects(plugin.provider.models({ models: previous }, { auth: auth() }), /Invalid model catalog/)
   t.mock.restoreAll()
   t.mock.method(globalThis, "fetch", async () => new Response("not JSON"))
   assert.match((await plugin.auth.usage(async () => auth())).error, /not JSON/)

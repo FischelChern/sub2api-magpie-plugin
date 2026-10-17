@@ -238,7 +238,7 @@ test("advanced headers work with only baseUrl configured and add no login prompt
   const models = await plugin.provider.models({ models: {} }, { auth })
   assert.equal(models["deepseek-chat"].api.url, baseUrl + "/v1")
   await loader.fetch(baseUrl + "/v1/chat/completions", { method: "POST", body: "{}" })
-  assert.equal(calls.length, 4)
+  assert.equal(calls.length, 3)
   for (const { init } of calls) {
     const headers = new Headers(init.headers)
     assert.equal(headers.get("user-agent"), "my-client")

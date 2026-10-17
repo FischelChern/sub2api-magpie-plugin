@@ -42,5 +42,18 @@
         "my-domestic-alias": "chat-completions"
       }
     }
-  ]
+  ],
+  "diagnostics": false,
+  "query": {
+    "timeoutMs": 15000,
+    "effortsTimeoutMs": 1000,
+    "modelsTtlMs": 60000,
+    "usageTtlMs": 5000,
+    "effortsTtlMs": 300000,
+    "maxResponseBytes": 4194304
+  },
+  "modelNames": {},
+  "modelOverrides": {},
+  "speedModels": ["fast", "ultraspeed"],
+  "excludeModels": []
 }

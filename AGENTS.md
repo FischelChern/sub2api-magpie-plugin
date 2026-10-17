@@ -18,6 +18,7 @@ No dependency installation, compilation, or standalone development server is req
 - `npm run check`: syntax-check `index.mjs`.
 - `npm test`: run the suite through Node's built-in test runner.
 - `npm pack --dry-run`: inspect the package contents without creating a release archive.
+- `npm run hooks:install`: enable the repository's automatic version bump on commits in this clone.
 - `magpie plugin add "$PWD"`: register this local directory in an installed Magpie client.
 - `magpie plugin login sub2api`: configure an account for manual integration testing.
 
@@ -31,7 +32,7 @@ Use `node:test`, `node:assert/strict`, and test-scoped fetch mocks. Add descript
 
 ## Commit & Pull Request Guidelines
 
-This checkout has no Git metadata, so historical commit conventions cannot be verified. Use concise, imperative commit subjects describing one focused change. Pull requests should explain behavior changes, link relevant issues, list validation commands and results, and update both READMEs where appropriate. Include screenshots only for display changes.
+Use concise Chinese commit subjects describing one focused change. Every commit must increase `package.json`'s version; enable `.githooks/pre-commit` with `npm run hooks:install` before committing. The hook increments the patch version relative to HEAD unless a higher version is already staged, and refuses unstaged package changes. Do not skip the hook or create a separate version-only commit for an ordinary change. Pull requests should explain behavior changes, link relevant issues, list validation commands and results, and update both READMEs where appropriate. Include screenshots only for display changes.
 
 ## Security & Configuration
 

@@ -21,6 +21,8 @@
 // Every function this module exports is called as a plugin by magpie, so
 // only the plugins are exported.
 
+import { createHash } from "node:crypto"
+
 const ID = "sub2api"
 const SLOTS = 8
 const CHAT = "@ai-sdk/openai-compatible"
@@ -42,10 +44,66 @@ const METADATA_HEADERS_MAX = 8 << 10
 const ICON_TIMEOUT = 3_000
 const ICON_MAX = 1 << 20
 const ICON_PAGE_MAX = 512 << 10
+const QUERY_DEFAULTS = {
+  timeoutMs: TIMEOUT,
+  effortsTimeoutMs: 1000,
+  modelsTtlMs: 60_000,
+  usageTtlMs: 5000,
+  effortsTtlMs: 300_000,
+  maxResponseBytes: 4 << 20,
+}
+const CACHE_MAX = 128
+const SPEED_HEADER = "x-magpie-sub2api-speed-model"
+const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
 
 const HOUR = 3600
 const DAY = 24 * HOUR
 const SPANS = { "5h": ["5 hours", 5 * HOUR], "1d": ["24 hours", DAY], "7d": ["7 days", 7 * DAY] }
+
+function fingerprint(...parts) {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex")
+}
+
+function querySettings(...layers) {
+  const out = { ...QUERY_DEFAULTS }
+  for (const layer of layers) {
+    if (layer?.query === undefined) continue
+    const value = layer.query
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("query must be a JSON object")
+    for (const [name, number] of Object.entries(value)) {
+      if (!Object.hasOwn(out, name)) throw new Error("Unknown query option")
+      const max = name === "maxResponseBytes" ? 64 << 20 : name.endsWith("TtlMs") ? 3_600_000 : 60_000
+      const min = name.endsWith("TtlMs") ? 0 : 1
+      if (!Number.isSafeInteger(number) || number < min || number > max) throw new Error("query option is outside its allowed range")
+      out[name] = number
+    }
+  }
+  return out
+}
+
+function diagnostics(...layers) {
+  let enabled = false
+  for (const layer of layers) {
+    if (layer?.diagnostics === undefined) continue
+    if (typeof layer.diagnostics !== "boolean") throw new Error("diagnostics must be a boolean")
+    enabled = layer.diagnostics
+  }
+  // Only fixed event names, status codes and timings reach stderr, never URLs,
+  // account names, model names, response bodies or headers.
+  return (event, details = {}) => {
+    if (enabled) console.error("magpie-sub2api: " + JSON.stringify({ event, ...details }))
+  }
+}
+
+function cacheSet(cache, key, value) {
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value)
+}
+
+function accountScope(base, key, headers) {
+  return fingerprint(base, key, Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)))
+}
 
 // ---- the site -----------------------------------------------------------------
 
@@ -71,6 +129,7 @@ const RESERVED_HEADERS = new Set([
   "authorization", "proxy-authorization", "x-api-key", "x-goog-api-key",
   "host", "content-length", "connection", "transfer-encoding", "upgrade",
   "keep-alive", "te", "trailer", "proxy-connection", "accept-encoding",
+  SPEED_HEADER,
 ])
 
 function customHeaders(value) {
@@ -171,6 +230,103 @@ function modelProtocol(id, routing) {
   return "chat-completions"
 }
 
+function mergeModel(...values) {
+  const out = {}
+  for (const value of values) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue
+    for (const [key, next] of Object.entries(value)) {
+      if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error("Invalid model metadata field")
+      out[key] = next && typeof next === "object" && !Array.isArray(next) ? mergeModel(out[key], next) : next
+    }
+  }
+  return out
+}
+
+function modelSettings(...layers) {
+  const out = { includeModels: undefined, excludeModels: [], modelNames: {}, modelOverrides: {}, speedModels: ["fast", "ultraspeed"] }
+  for (const layer of layers) {
+    if (!layer) continue
+    if (layer.speedModels !== undefined) {
+      const value = layer.speedModels
+      const valid = (speeds) => Array.isArray(speeds) && speeds.every((speed) => typeof speed === "string" && Object.hasOwn(SPEEDS, speed))
+      if (Array.isArray(value)) {
+        if (!valid(value)) throw new Error("speedModels supports only fast and ultraspeed")
+        out.speedModels = [...new Set(value)]
+      } else {
+        if (!value || typeof value !== "object") throw new Error("speedModels must be an array or a model-to-speeds object")
+        const next = Array.isArray(out.speedModels) ? {} : { ...out.speedModels }
+        for (const [model, speeds] of Object.entries(value)) {
+          if (!model || ["__proto__", "constructor", "prototype"].includes(model) || !valid(speeds)) throw new Error("Invalid model speed configuration")
+          next[model] = [...new Set(speeds)]
+        }
+        out.speedModels = next
+      }
+    }
+    for (const field of ["includeModels", "excludeModels"]) {
+      if (layer[field] === undefined) continue
+      if (!Array.isArray(layer[field]) || layer[field].some((id) => typeof id !== "string" || !id)) throw new Error(`${field} must be an array of model IDs`)
+      out[field] = [...layer[field]]
+    }
+    for (const field of ["modelNames", "modelOverrides"]) {
+      if (layer[field] === undefined) continue
+      const values = layer[field]
+      if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error(`${field} must be a JSON object`)
+      for (const [id, value] of Object.entries(values)) {
+        if (!id || ["__proto__", "constructor", "prototype"].includes(id)) throw new Error("Invalid model ID in model settings")
+        if (field === "modelNames") {
+          if (typeof value !== "string" || !value.trim()) throw new Error("modelNames requires non-empty names")
+          out.modelNames[id] = value
+        } else {
+          if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("modelOverrides requires model metadata objects")
+          if (Object.keys(value).some((key) => !["name", "limit", "cost", "capabilities", "options", "headers", "variants", "release_date", "status"].includes(key))) {
+            throw new Error("modelOverrides cannot change model identity, credentials or API routing")
+          }
+          for (const key of ["limit", "cost", "capabilities", "options", "headers", "variants"]) {
+            if (value[key] !== undefined && (!value[key] || typeof value[key] !== "object" || Array.isArray(value[key]))) throw new Error("Model metadata fields must be objects")
+          }
+          if (value.options && ["apiKey", "baseURL", "baseUrl", "headers", "fetch"].some((key) => Object.hasOwn(value.options, key))) throw new Error("Model options cannot override account credentials or routing")
+          for (const field of ["name", "status", "release_date"]) {
+            if (value[field] !== undefined && typeof value[field] !== "string") throw new Error("Model display fields must be strings")
+          }
+          for (const number of Object.values(value.limit ?? {})) {
+            if (typeof number !== "number" || !Number.isFinite(number) || number < 0) throw new Error("Model limits must be non-negative numbers")
+          }
+          for (const [field, flag] of Object.entries(value.capabilities ?? {})) {
+            if (["input", "output"].includes(field)) {
+              if (!flag || typeof flag !== "object" || Array.isArray(flag) || Object.values(flag).some((flag) => typeof flag !== "boolean")) throw new Error("Model modalities must contain boolean flags")
+            } else if (field !== "interleaved" && typeof flag !== "boolean") throw new Error("Model capabilities must contain boolean flags")
+          }
+          const checked = { ...value, ...(value.headers === undefined ? {} : { headers: customHeaders(value.headers) }) }
+          out.modelOverrides[id] = mergeModel(out.modelOverrides[id], checked)
+        }
+      }
+    }
+  }
+  return out
+}
+
+function speedProfiles(model, protocol, selection) {
+  // Defaults are request presets for Responses, not a promise of key eligibility.
+  const speeds = Array.isArray(selection.speedModels)
+    ? protocol === "responses" ? selection.speedModels : []
+    : selection.speedModels[model] ?? []
+  if (speeds.length && (protocol === "gemini" || (protocol === "anthropic" && speeds.includes("ultraspeed")))) {
+    throw new Error("This protocol does not support the configured model speed")
+  }
+  return speeds
+}
+
+function validatePrices(selection) {
+  for (const override of Object.values(selection.modelOverrides)) {
+    if (override.cost === undefined) continue
+    const prices = [override.cost.input, override.cost.output, override.cost.cache?.read, override.cost.cache?.write]
+    if (prices.some((number) => typeof number !== "number" || !Number.isFinite(number) || number < 0)) {
+      throw new Error("Model cost requires input, output, cache.read and cache.write prices in USD per million tokens")
+    }
+  }
+  return selection
+}
+
 async function metadataBody(input, init) {
   const body = init?.body
   if (typeof body === "string") return Buffer.byteLength(body) <= METADATA_BODY_MAX ? body : undefined
@@ -230,13 +386,15 @@ async function codexMetadataHeaders(input, init, headers) {
   }
 }
 
-function accountFetch(base, key, extra, routing, protocolExtra = {}) {
+function accountFetch(base, key, extra, routing, protocolExtra = {}, report = () => {}, catalogState = () => undefined) {
   // The host's loader baseURL overrides individual model URLs. Resolve the
   // protocol from its generated endpoint and route it to the configured path.
   const prefixes = [...new Set([...Object.values(DEFAULT_PATHS), ...Object.values(routing.apiPaths)])]
     .map((path) => new URL(base + path.replace(/\/+$/, "") + "/"))
     .sort((a, b) => b.pathname.length - a.pathname.length)
   return async (input, init) => {
+    const state = catalogState()
+    if (state?.error) throw state.error
     const url = new URL(input instanceof Request ? input.url : input)
     const allowed = prefixes.find((prefix) => url.origin === prefix.origin && url.pathname.startsWith(prefix.pathname))
     if (!allowed || url.username || url.password) {
@@ -251,8 +409,42 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}) {
     if (protocol) target.pathname = new URL(base + routing.apiPaths[protocol].replace(/\/+$/, "") + "/").pathname + suffix
     // A caller's Gemini query key must never select a different account.
     if (protocol === "gemini") target.searchParams.delete("key")
+    report("inference.route", { protocol: protocol ?? "unknown" })
     const headers = new Headers(input instanceof Request ? input.headers : undefined)
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value))
+    const marker = headers.get(SPEED_HEADER)
+    headers.delete(SPEED_HEADER)
+    const body = init?.body
+    let payload
+    // Leave ordinary streaming uploads untouched. A speed preset must be
+    // inspectable so it cannot silently run at the wrong model or tier.
+    if (marker || (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)))) {
+      try {
+        const text = typeof body === "string" ? body
+          : body instanceof ArrayBuffer || ArrayBuffer.isView(body) ? new TextDecoder().decode(body)
+          : await metadataBody(input, init)
+        payload = JSON.parse(text)
+      } catch {}
+    }
+    let selected
+    if (marker) {
+      try { selected = state?.speedAliases?.get(decodeURIComponent(marker)) } catch {}
+      if (!selected) throw new Error("The selected speed model is not listed for this Sub2API account")
+    } else if (typeof payload?.model === "string") selected = state?.speedAliases?.get(payload.model)
+    if (selected) {
+      if (!payload || (payload.model !== selected.id && payload.model !== selected.model)) throw new Error("The speed preset does not match the requested model")
+      if (protocol !== selected.protocol) throw new Error("The speed preset does not match the requested API protocol")
+      if (headers.has("content-encoding") && headers.get("content-encoding") !== "identity") throw new Error("Speed presets require an uncompressed JSON request")
+      payload.model = selected.model
+      if (protocol === "anthropic") payload.speed = "fast"
+      else payload.service_tier = SPEEDS[selected.speed]
+      init = { ...init, body: JSON.stringify(payload) }
+      headers.delete("content-length")
+      if (!headers.has("content-type")) headers.set("content-type", "application/json")
+    }
+    if (state?.ids && typeof payload?.model === "string" && !state.ids.has(payload.model)) {
+      throw new Error("The selected model is not listed for this Sub2API account")
+    }
     // Generic host identity must not override the selected protocol's identity.
     if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
     if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
@@ -267,7 +459,15 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}) {
     // Never follow a redirect with this account's extra headers or API key.
     const destination = target.href === url.href ? input
       : input instanceof Request ? new Request(target, input) : target.href
-    return fetch(destination, { ...init, headers, redirect: "error" })
+    const started = Date.now()
+    try {
+      const response = await fetch(destination, { ...init, headers, redirect: "error" })
+      report("inference.response", { protocol: protocol ?? "unknown", status: response.status, elapsedMs: Date.now() - started })
+      return response
+    } catch (error) {
+      report("inference.failed", { protocol: protocol ?? "unknown", elapsedMs: Date.now() - started })
+      throw error
+    }
   }
 }
 
@@ -384,10 +584,11 @@ async function siteIcon(base) {
 // two on one site) tell apart. magpie keys an account's own settings (its
 // models, its share) by this name, so it stays as it was given.
 function label(auth, base) {
+  if (typeof auth?.accountId === "string" && auth.accountId) return auth.accountId
   const given = typeof auth?.metadata?.name === "string" ? auth.metadata.name.trim().slice(0, 60) : ""
   if (given) return given
   const key = typeof auth?.key === "string" ? auth.key : ""
-  const tail = key.length >= 8 ? " …" + key.slice(-4) : ""
+  const tail = key ? " …" + key.slice(-4) + " [" + fingerprint(base, key).slice(0, 8) + "]" : ""
   return base ? hostOf(base) + tail : ""
 }
 
@@ -404,26 +605,97 @@ async function named(client, id, auth, base) {
   } catch {}
 }
 
-async function get(base, path, key, extra = {}) {
+function queryError(message, status, kind) {
+  const error = new Error(message)
+  error.status = status
+  error.kind = kind
+  if (status === 401) error.signIn = "expired"
+  return error
+}
+
+async function responseBytes(res, limit, signal) {
+  if (Number(res.headers.get("content-length")) > limit) {
+    void res.body?.cancel().catch(() => {})
+    throw queryError("Management response exceeds the size limit", res.status, "size")
+  }
+  if (!res.body) return Buffer.alloc(0)
+  const reader = res.body.getReader()
+  const chunks = []
+  let size = 0
+  const cancel = () => { void reader.cancel().catch(() => {}) }
+  signal.addEventListener("abort", cancel, { once: true })
+  try {
+    signal.throwIfAborted()
+    while (true) {
+      const { done, value } = await reader.read()
+      signal.throwIfAborted()
+      if (done) break
+      size += value.byteLength
+      if (size > limit) throw queryError("Management response exceeds the size limit", res.status, "size")
+      chunks.push(Buffer.from(value))
+    }
+    return Buffer.concat(chunks, size)
+  } finally {
+    signal.removeEventListener("abort", cancel)
+    cancel()
+    reader.releaseLock()
+  }
+}
+
+async function get(base, path, key, extra = {}, settings = QUERY_DEFAULTS, timeout = settings.timeoutMs) {
+  const signal = AbortSignal.timeout(timeout)
   const res = await fetch(base + path, {
     headers: { accept: "application/json", ...extra, authorization: `Bearer ${key}` },
-    signal: AbortSignal.timeout(TIMEOUT),
+    signal,
     redirect: "error",
   })
-  const text = await res.text()
-  let body
-  try {
-    body = JSON.parse(text)
-  } catch {}
   if (!res.ok) {
-    // the gateway's own errors, {error:{message}}, and its middleware's, {code, message}
-    const why = body?.error?.message ?? body?.message ?? body?.code ?? (text.trim().slice(0, 200) || res.statusText)
-    const err = new Error(`${res.status} ${why}`)
-    if (res.status === 401) err.signIn = "expired"
-    throw err
+    void res.body?.cancel().catch(() => {})
+    // Never echo a gateway response: it may contain reflected credentials.
+    throw queryError(`Sub2API query returned HTTP ${res.status}`, res.status, "http")
   }
-  if (body === undefined) throw new Error(`${path}: not JSON`)
-  return body
+  const bytes = await responseBytes(res, settings.maxResponseBytes, signal)
+  try {
+    return JSON.parse(bytes.toString("utf8"))
+  } catch {
+    throw queryError("Sub2API query response is not JSON", res.status, "json")
+  }
+}
+
+function queries(onExpired) {
+  const cache = new Map()
+  return async (base, path, key, extra, settings, report, operation) => {
+    const scope = accountScope(base, key, extra)
+    const name = scope + ":" + fingerprint(path, settings)
+    const ttl = settings[`${operation}TtlMs`]
+    const cached = cache.get(name)
+    if (cached && (cached.pending || cached.expires > Date.now())) {
+      report("query.cache", { operation, pending: cached.pending })
+      return cached.promise
+    }
+    const entry = { pending: true, expires: 0 }
+    const started = Date.now()
+    entry.promise = get(base, path, key, extra, settings, operation === "efforts" ? settings.effortsTimeoutMs : settings.timeoutMs)
+      .then((value) => {
+        if (operation === "models" && !Array.isArray(value?.data)) throw queryError("Invalid model catalog", undefined, "catalog")
+        entry.pending = false
+        entry.expires = Date.now() + ttl
+        report("query.complete", { operation, elapsedMs: Date.now() - started })
+        return value
+      }).catch((error) => {
+        entry.pending = false
+        if (error.signIn) {
+          onExpired(scope, error)
+          for (const name of cache.keys()) if (name.startsWith(scope + ":")) cache.delete(name)
+        } else if (operation === "efforts") entry.expires = Date.now() + 30_000
+        else if (cache.get(name) === entry) cache.delete(name)
+        report("query.failed", { operation, status: error.status ?? 0, reason: error.kind ?? "network", elapsedMs: Date.now() - started })
+        if (error.kind || error.signIn) throw error
+        throw queryError("Sub2API query failed or timed out", undefined, "network")
+      })
+    cacheSet(cache, name, entry)
+    return entry.promise
+  }
 }
 
 // ---- models -------------------------------------------------------------------
@@ -438,10 +710,10 @@ const variantsOf = (levels) => Object.fromEntries(levels.map((l) => [l, {}]))
 // first of: the levels the site tells (told), the variants magpie already
 // has for the model (was: models.dev's, the config's), LEVELS when the
 // model thinks.
-function runtimeModel(m, url, providerID, told, was, npm) {
+function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   const kept = was?.variants && typeof was.variants === "object" && Object.keys(was.variants).length ? was.variants : undefined
-  const reasoning = !!told?.length || !!kept || npm !== CHAT || /think|reason/i.test(m.id)
-  return {
+  const reasoning = !!told?.length || !!kept || /think|reason|(?:^|\/)(?:o\d|gpt-5|codex-)/i.test(m.id)
+  const defaults = {
     id: m.id,
     providerID,
     name: m.name,
@@ -449,20 +721,30 @@ function runtimeModel(m, url, providerID, told, was, npm) {
     status: "active",
     headers: {},
     options: {},
-    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
     limit: { context: 0, output: 0 },
     capabilities: {
       temperature: true,
       reasoning,
-      attachment: npm !== CHAT,
+      attachment: false,
       toolcall: true,
-      input: { text: true, image: npm !== CHAT, audio: false, video: false, pdf: false },
+      input: { text: true },
       output: { text: true, image: false, audio: false, video: false, pdf: false },
       interleaved: false,
     },
     release_date: "",
     variants: told?.length ? variantsOf(told) : (kept ?? (reasoning ? variantsOf(LEVELS) : {})),
   }
+  const out = mergeModel(defaults, was, override)
+  // Account ownership and transport are never inherited from another source.
+  out.id = m.id
+  out.providerID = providerID
+  out.api = { id: m.id, url, npm }
+  delete out.headers[SPEED_HEADER]
+  out.name = override.name ?? (m.named ? m.name : was?.name ?? m.name)
+  if (told?.length && override.variants === undefined) out.variants = variantsOf(told)
+  if (override.variants !== undefined) out.variants = mergeModel(override.variants)
+  if (override.capabilities?.reasoning === undefined && told?.length) out.capabilities.reasoning = true
+  return out
 }
 
 // efforts are each model's reasoning levels, by id, as the site's Codex
@@ -472,14 +754,14 @@ function runtimeModel(m, url, providerID, told, was, npm) {
 // upstream as the Codex version it keeps. Only a help: a site that can't
 // tell is no levels. sub2api lists a model it knows nothing of as ["none"]
 // alone, which tells no levels either; "none" next to others is one.
-async function efforts(base, key, extra) {
+async function efforts(query, base, key, extra, settings, report) {
   let body
   try {
-    body = await get(base, "/backend-api/codex/models", key, extra)
+    body = await query(base, "/backend-api/codex/models", key, extra, settings, report, "efforts")
   } catch {
     return {}
   }
-  const out = {}
+  const out = Object.create(null)
   for (const m of Array.isArray(body?.models) ? body.models : []) {
     if (typeof m?.slug !== "string" || !Array.isArray(m.supported_reasoning_levels)) continue
     const levels = []
@@ -495,16 +777,65 @@ async function efforts(base, key, extra) {
 // models is what GET /v1/models lists for the key: its group's, in
 // Anthropic's shape or OpenAI's as the group's platform has it; was is the
 // models magpie already has.
-async function models(id, base, auth, was = {}, extra = {}, routing = routingOf()) {
-  const [body, told] = await Promise.all([get(base, "/v1/models", auth.key, extra), efforts(base, auth.key, extra)])
-  const out = Object.create(null)
-  for (const m of Array.isArray(body?.data) ? body.data : []) {
-    if (typeof m?.id !== "string" || !m.id) continue
-    const name = typeof m.display_name === "string" && m.display_name ? m.display_name : m.id
-    const protocol = modelProtocol(m.id, routing)
-    out[m.id] = runtimeModel({ id: m.id, name }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id], was?.[m.id], PROTOCOLS[protocol])
+async function models(id, base, auth, was, extra, routing, settings, selection, query, report) {
+  const entries = []
+  const seen = new Set()
+  let totalBytes = 0
+  let path = "/v1/models"
+  for (let page = 0; path; page++) {
+    if (page >= 100 || seen.has(path)) throw queryError("Invalid or excessive model pagination", undefined, "pagination")
+    seen.add(path)
+    const body = await query(base, path, auth.key, extra, settings, report, "models")
+    if (!Array.isArray(body?.data)) throw queryError("Invalid model catalog", undefined, "catalog")
+    totalBytes += Buffer.byteLength(JSON.stringify(body))
+    if (totalBytes > settings.maxResponseBytes) throw queryError("Combined model catalog exceeds the size limit", undefined, "size")
+    for (const entry of body.data) entries.push(entry)
+    if (typeof body.next === "string" && body.next) {
+      const endpoint = new URL(base + "/v1/models")
+      let next
+      try { next = new URL(body.next, base + path) } catch { throw queryError("Invalid model pagination URL", undefined, "pagination") }
+      if (next.origin !== endpoint.origin || next.pathname !== endpoint.pathname || next.username || next.password || next.hash) {
+        throw queryError("Refusing model pagination outside this account's model endpoint", undefined, "pagination")
+      }
+      path = "/v1/models" + next.search
+    } else if (body.has_more === true) {
+      const last = body.last_id ?? body.data.at(-1)?.id
+      if (typeof last !== "string" || !last) throw queryError("Missing model pagination cursor", undefined, "pagination")
+      path = "/v1/models?after_id=" + encodeURIComponent(last)
+    } else path = undefined
   }
-  if (!Object.keys(out).length) throw new Error("/v1/models: an empty list")
+  const told = entries.some((m) => typeof m?.id === "string" && modelProtocol(m.id, routing) === "responses")
+    ? await efforts(query, base, auth.key, extra, settings, report) : {}
+  const out = Object.create(null)
+  const upstreamIds = new Set(entries.map((m) => m?.id).filter((id) => typeof id === "string" && id))
+  for (const m of entries) {
+    if (typeof m?.id !== "string" || !m.id) continue
+    const display = selection.modelNames[m.id] ?? m.display_name ?? m.name
+    const named = typeof display === "string" && !!display
+    const name = named ? display : m.id
+    const protocol = modelProtocol(m.id, routing)
+    out[m.id] = runtimeModel({ id: m.id, name, named }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id], was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
+    if (selection.modelNames[m.id]) out[m.id].name = selection.modelNames[m.id]
+    for (const speed of speedProfiles(m.id, protocol, selection)) {
+      const alias = m.id + "-" + speed
+      // An actual upstream ID always wins, even when it is filtered out later.
+      if (upstreamIds.has(alias)) { report("models.speed_collision"); continue }
+      const override = selection.modelOverrides[alias] ?? {}
+      const preset = mergeModel(out[m.id], override)
+      if (override.variants !== undefined) preset.variants = mergeModel(override.variants)
+      preset.id = alias
+      preset.name = selection.modelNames[alias] ?? override.name ?? `${out[m.id].name} (${speed})`
+      preset.headers[SPEED_HEADER] = encodeURIComponent(alias)
+      // Base-tier prices cannot safely price accelerated requests.
+      for (const field of ["cost", "free", "rate"]) delete preset[field]
+      if (override.cost) preset.cost = mergeModel(override.cost)
+      out[alias] = preset
+    }
+  }
+  for (const model of Object.keys(out)) {
+    if ((selection.includeModels && !selection.includeModels.includes(model)) || selection.excludeModels.includes(model)) delete out[model]
+  }
+  report("models.ready", { discovered: entries.length, visible: Object.keys(out).length })
   return out
 }
 
@@ -582,13 +913,13 @@ function fromUsage(u) {
   return { plan, error: "No active subscription for this key's group", windows: [] }
 }
 
-async function usage(client, id, auth, base, extra) {
+async function usage(client, id, auth, base, extra, query, settings, report) {
   if (auth?.type !== "api" || !auth.key) return { error: "not signed in" }
   if (!base) return { error: "No sub2api address saved with this key; sign in again" }
   await named(client, id, auth, base)
   const user = label(auth, base)
   try {
-    return { user, ...fromUsage(await get(base, "/v1/usage", auth.key, extra)) }
+    return { user, ...fromUsage(await query(base, "/v1/usage", auth.key, extra, settings, report, "usage")) }
   } catch (e) {
     return { user, error: String(e?.message ?? e), windows: [], ...(e?.signIn ? { signIn: e.signIn } : {}) }
   }
@@ -645,6 +976,15 @@ function sitesOf(options, tell) {
 // options) or each account's own (the "sub2api" provider's, asked at
 // sign-in).
 function hooks(client, id, site, options) {
+  const catalogs = new Map()
+  const expired = new Map()
+  const query = queries((scope, error) => { cacheSet(expired, scope, error) })
+  const configuredQuery = querySettings(options, site)
+  const queryFor = (auth) => querySettings({ query: configuredQuery }, auth?.metadata)
+  const configuredModels = validatePrices(modelSettings(options, site))
+  const modelsFor = (auth) => validatePrices(modelSettings(configuredModels, auth?.metadata))
+  diagnostics(options, site)
+  const reportFor = (auth) => diagnostics(options, site, auth?.metadata)
   // Validate even overridden layers, so invalid config cannot silently drop a header.
   const configured = mergedHeaders(options?.headers, site?.headers)
   const headersOf = (auth) => mergedHeaders(configured, auth?.metadata?.headers)
@@ -711,7 +1051,13 @@ function hooks(client, id, site, options) {
       const headers = headersOf(auth)
       const routing = routingFor(auth)
       const protocolHeaders = protocolHeadersFor(auth)
-      return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing, protocolHeaders) }
+      queryFor(auth)
+      modelsFor(auth)
+      const report = reportFor(auth)
+      const scope = accountScope(base, auth.key, headers)
+      const catalogKey = fingerprint(scope, routing, modelsFor(auth))
+      const state = () => expired.has(scope) ? { error: expired.get(scope) } : catalogs.get(catalogKey)
+      return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing, protocolHeaders, report, state) }
     },
     methods: [
       {
@@ -725,7 +1071,7 @@ function hooks(client, id, site, options) {
     async usage(getAuth) {
       const auth = await getAuth()
       try {
-        return await usage(client, id, auth, baseOf(auth), headersOf(auth))
+        return await usage(client, id, auth, baseOf(auth), headersOf(auth), query, queryFor(auth), reportFor(auth))
       } catch (e) {
         return { error: e.message, windows: [] }
       }
@@ -733,22 +1079,43 @@ function hooks(client, id, site, options) {
   }
   return {
     auth: authHook,
+    "chat.headers": async ({ model }, output) => {
+      if (model?.providerID !== id || !model.headers?.[SPEED_HEADER]) return
+      output.headers[SPEED_HEADER] = model.headers[SPEED_HEADER]
+    },
     // the key's group's list, asked of the account's site
     provider: {
       id,
       async models(provider, { auth } = {}) {
-        if (auth?.type !== "api" || !auth.key) return provider.models
+        if (auth?.type !== "api" || !auth.key) return {}
         const base = baseOf(auth)
-        if (!base) return provider.models
+        if (!base) throw new Error("No Sub2API address saved with this key")
         const routing = routingFor(auth)
-        const icon = refreshIcon(base, true)
+        const headers = headersOf(auth)
+        const settings = queryFor(auth)
+        const selection = modelsFor(auth)
+        const report = reportFor(auth)
+        const scope = accountScope(base, auth.key, headers)
+        const catalogKey = fingerprint(scope, routing, selection)
+        // Cosmetic discovery must not hold up the account's model catalog.
+        void refreshIcon(base, true).catch(() => report("icon.failed"))
         try {
-          return await models(id, base, auth, provider?.models, headersOf(auth), routing)
+          const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report)
+          expired.delete(scope)
+          const speedAliases = new Map()
+          for (const model of Object.values(found)) {
+            if (!model.headers?.[SPEED_HEADER]) continue
+            const speed = Object.keys(SPEEDS).find((speed) => model.id === model.api.id + "-" + speed)
+            if (speed) speedAliases.set(model.id, { id: model.id, model: model.api.id, speed, protocol: modelProtocol(model.api.id, routing) })
+          }
+          cacheSet(catalogs, catalogKey, { ids: new Set(Object.values(found).map((model) => model.api.id)), speedAliases })
+          return found
         } catch (e) {
-          if (e?.signIn) throw e
-          return provider.models
-        } finally {
-          await icon
+          cacheSet(catalogs, catalogKey, { error: e })
+          report("models.failed", { status: e.status ?? 0, reason: e.kind ?? "configuration" })
+          // Never replace an unavailable model with the host's or another key's
+          // catalog, and never return an old list as a successful refresh.
+          throw e
         }
       },
     },

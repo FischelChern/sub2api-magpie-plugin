@@ -21,11 +21,11 @@ The only extra sign-in prompt is the site's **Base URL**, such as `https://api.e
 
 Alternatively, set just `{"baseUrl":"https://api.example.com"}` in plugin options. Sign-in then asks only for the API key. `url`, `baseURL` and `baseUrl` are accepted in that order of precedence. This default does not override a saved account URL. HTTP/HTTPS, IP addresses with ports and deployment prefixes are supported. All configuration below is optional and intended for advanced overrides.
 
-Each sign-in adds an account to the `sub2api` pool. Do not rename an account after first use: Magpie indexes its models and settings by that name. Previously saved account names and advanced metadata remain supported.
+Each sign-in adds an account to the `sub2api` pool. New default names contain the host, last four key characters and a short URL/key digest to reduce collisions between keys or deployment paths. Existing account IDs remain unchanged. Do not rename an account after first use: Magpie indexes its models and settings by that name. Previously saved account names and advanced metadata remain supported.
 
 ### Automatic Site Icons
 
-With a configured site address, the plugin discovers the home page's `<link rel="icon">` / `apple-touch-icon` while loading configuration, falling back to `favicon.ico` under the deployment prefix and then at the origin root. Accounts that supply their URL only at sign-in discover their icon when loading models. HTTP/HTTPS, IP addresses with ports and deployment prefixes work without an extra image option.
+With a configured site address, the plugin discovers the home page's `<link rel="icon">` / `apple-touch-icon` while loading configuration, falling back to `favicon.ico` under the deployment prefix and then at the origin root. Accounts that supply their URL only at sign-in discover their icon in the background when loading models, without blocking the catalog. The configuration hook still waits for the initial icon so the host can read it. HTTP/HTTPS, IP addresses with ports and deployment prefixes work without an extra image option.
 
 - Separate site providers have separate icons. The pooled `sub2api` provider uses the first account whose models are loaded during this plugin instance, so later accounts cannot overwrite it. A configured default URL supplies the icon only until an account is loaded.
 - Images reach Magpie through `auth.icon` as `data:image/…` URIs. PNG, JPEG, GIF, WebP, ICO and SVG are supported; no downloaded files are written into the repository or package.
@@ -105,12 +105,12 @@ Site IDs must start with a lowercase letter or digit, contain only lowercase let
 ## Models and Usage
 
 - `GET /v1/models`: models available to this key's group. Auto mode uses Messages for Claude, Responses for OpenAI model names, native Gemini for Gemini names, and Chat Completions for domestic/other compatible models. Namespaced model IDs are recognized as well.
-- `GET /backend-api/codex/models`: optional reasoning levels. Existing levels or defaults are retained when unavailable.
+- `GET /backend-api/codex/models`: optional reasoning levels, queried only for catalogs containing Responses models, with a separate one-second timeout. Existing levels or model-name-based defaults are retained when unavailable.
 - `GET /v1/usage`: subscription day/week/month windows and expiry, key quota/rate-limit windows, or wallet balance.
 - Usage-window exhaustion participates in Magpie routing. Wallet balance is displayed only, without a routing window.
 - Only the current key's group is visible, not all user subscriptions or purchasable plans.
 - Reset times come from the server; weekly start + 7 days is a fallback, but daily/monthly reset times are not guessed.
-- HTTP 401 marks sign-in as expired; transient model-list failures retain the previous catalog.
+- HTTP 401 marks sign-in as expired. Model-list failures propagate rather than returning host defaults, another key's models or a stale catalog as a successful refresh.
 - Model response status, streaming bodies and cancellation signals are preserved.
 
 The inherited compatibility target is Sub2API >= 0.2.14. No live site or server-version matrix has been validated for this local extension. Endpoint availability still depends on the site and key's group. Support covers four conversational protocols, not every vendor's private web login, realtime audio/video, images, embeddings or batch APIs.
@@ -132,7 +132,121 @@ Set `apiPaths` to override the base path for each protocol, e.g. `{"apiPaths":{"
 
 The loader's base URL overrides per-model URLs in Magpie; the account fetch function therefore resolves the operation's protocol and selects the final path, including native Gemini `/v1beta/`. Only the account origin and configured API paths are allowed. Anthropic gets the selected account's `x-api-key` and a default `anthropic-version` when absent. Gemini gets `x-goog-api-key`, and caller-provided query-string `key` values are removed. These settings are also available in account metadata as `protocol`, `modelProtocols` and `apiPaths`; reload the account and model list after changing them.
 
+## Complete Catalogs and Multiple Keys
+
+Every API-key sign-in is a separate account. Its `/v1/models` request uses that account's key and returns all valid model IDs by default, including unfamiliar names, namespaced IDs and non-chat models. Listing an image or embedding model does not implement its non-conversational API.
+
+- Supports `data` lists, `has_more` / `last_id` cursor pagination and `next` URLs. Every page stays on this account's exact `/v1/models` endpoint, including the deployment prefix. More than 100 pages, excessive combined JSON size, cycles, unsafe URLs or a failed page produce an error, never a truncated catalog.
+- Magpie receives each account's own model list. A model listed only by A uses A's transport; one listed only by B uses B's. For shared model IDs, Magpie chooses an eligible account, then uses that account's Base URL, key and headers. Keys are not embedded in model objects or bound globally to the last account loaded.
+- Keys may belong to different sites or different groups on one site. In-memory query caches use digests of the address, key and merged headers, without persisting credentials.
+- Refreshes preserve known context/output limits, prices, capabilities, options and model headers, while rebuilding the current account's model identity, SDK and API address. Unknown prices are omitted instead of set to zero; protocol alone does not determine vision or reasoning support.
+- Failed discovery throws. It does not return a host default, another account's list or an expired list as success. Recorded failures also block an already-created account transport from using a catalog the host may retain, until discovery recovers. Safely inspectable request model IDs are checked against the discovered account catalog; streaming uploads are not consumed for this check.
+- Inference sends once and leaves the model unchanged, returning the original response/status/stream or network error. The plugin does not retry, switch keys or substitute models. Host routing groups and provider fallbacks remain Magpie settings, not settings this plugin rewrites. To forbid model fallback end to end, clear host fallback models and select `sub2api/<model>` or a site model directly. To pin a key, clients can send `X-Magpie-Account: <account name or ID>` to Magpie; do not configure it as an extra upstream header.
+
+### Optional Filters and Metadata Overrides
+
+Without filters, every key model remains visible, with the additional Responses speed presets described below. `includeModels` and `excludeModels` are exact full-ID lists, applied only when explicitly configured. `includeModels: []` deliberately hides all models. `modelNames` changes display names, never wire model IDs:
+
+```json
+{
+  "excludeModels": ["unused-model"],
+  "modelNames": {"custom-vision": "My Vision Model"},
+  "modelOverrides": {
+    "custom-vision": {
+      "limit": {"context": 128000, "output": 8192},
+      "capabilities": {
+        "attachment": true,
+        "toolcall": true,
+        "input": {"image": true}
+      },
+      "cost": {"input": 1.2, "output": 6, "cache": {"read": 0.12, "write": 1.5}}
+    }
+  }
+}
+```
+
+Values are illustrative: use your site's actual capabilities and prices. Overrides apply only to models already returned for the key; they do not create permissions. Precedence is global < site < account metadata. Filter arrays replace earlier arrays, names merge per ID, and metadata overrides merge deeply. Allowed fields are `name`, `limit`, `cost`, `capabilities`, `options`, `headers`, `variants`, `release_date` and `status`, not model identity, API routing or credentials. Model headers obey reserved-header validation. Continue using `modelProtocols` for protocol overrides.
+
+### Fast / Ultraspeed Presets
+
+The default `"speedModels": ["fast", "ultraspeed"]` generates two additional selectable presets for each Responses model while retaining the original. For an upstream `gpt-example`:
+
+| Selected Magpie model ID | Upstream `model` | Upstream speed parameter |
+| --- | --- | --- |
+| `gpt-example` | `gpt-example` | Client parameters unchanged |
+| `gpt-example-fast` | `gpt-example` | `service_tier: "priority"` |
+| `gpt-example-ultraspeed` | `gpt-example` | `service_tier: "ultrafast"` |
+
+Configuration uses **`fast` / `ultraspeed`**; the OpenAI-compatible wire values are **`priority` / `ultrafast`**. `ultraspeed` is not appended to the upstream model name or sent as a wire tier. Display names add `(fast)` / `(ultraspeed)` for clarity and can be customized with `modelNames`; `api.id` always remains the original model ID.
+
+Array configuration applies automatically only to Responses models. To target individual models, or explicitly enable a site's supported Chat Completions / Anthropic acceleration, use an object keyed by original model IDs:
+
+```json
+{
+  "speedModels": {
+    "gpt-example": ["fast", "ultraspeed"],
+    "my-chat-alias": ["fast"],
+    "claude-example": ["fast"]
+  }
+}
+```
+
+- Object mode targets only listed models; `"speedModels": []` disables all generation. Precedence is global < site < account `metadata.speedModels`. Arrays replace; consecutive objects merge per model; an empty array disables that model's presets. Set protocol aliases through `modelProtocols` as before.
+- Anthropic Fast sends `speed: "fast"` without inventing billing-related beta headers. If your site requires a beta header, configure `protocolHeaders.claude` according to its documentation. Anthropic Ultraspeed and Gemini presets are not implemented and explicit configuration fails rather than pretending support.
+- **Presets are request configurations, not proof of key eligibility or guaranteed acceleration.** `/v1/models` usually does not report tier access. Unsupported tiers return the upstream error, without trying the original model, another key, a lower speed or a different model. The plugin cannot prevent an upstream server from ignoring parameters.
+- Every preset comes from a real model listed for the current key and uses that account's Base URL, key and protocol path. Magpie's `chat.headers` hook carries the selection to the account transport; the private marker is removed before sending. The transport enforces the selected tier even if the host previously downgraded it. Requests without a speed preset are not rewritten.
+- A real upstream ID takes precedence over a generated ID collision. Generated models are not recursively expanded. `includeModels` / `excludeModels` also match generated IDs exactly; use `speedModels: []` to hide all speed presets.
+- Presets preserve original limits, capabilities and reasoning levels, but **do not inherit base-tier prices**. Configure actual prices through entries such as `modelOverrides.gpt-example-fast.cost`; absent prices remain unknown, not free.
+- Ordinary requests and response streams remain unchanged; presets rewrite only JSON model/speed fields. Direct streaming uploads or Request bodies that cannot be safely inspected fail explicitly instead of silently dropping the speed choice. Request inspection is bounded to 1 MiB.
+
+Disable Magpie's own account retries, routing groups and fallback models separately if you need end-to-end no-fallback behavior. The plugin never rewrites host routing configuration.
+
+## Query Performance and Diagnostics
+
+Management queries have bounded bodies, timeouts and same-account concurrent request coalescing. These limits do not buffer inference responses or impose a management timeout on them. Global, site and account `metadata` layers can override these options individually:
+
+```json
+{
+  "diagnostics": false,
+  "query": {
+    "timeoutMs": 15000,
+    "effortsTimeoutMs": 1000,
+    "modelsTtlMs": 60000,
+    "usageTtlMs": 5000,
+    "effortsTtlMs": 300000,
+    "maxResponseBytes": 4194304
+  }
+}
+```
+
+- TTLs are milliseconds, up to one hour. Set a TTL to `0` to disable completed-result caching while still coalescing in-flight queries. Reusing a successful result within its TTL is not stale fallback after failure. The query cache holds at most 128 entries, evicting earlier entries when full.
+- Query and reasoning timeouts accept 1-60000 milliseconds. JSON size accepts 1 byte to 64 MiB, default 4 MiB, checking both declared and actually read sizes.
+- Only catalogs containing Responses models query the Codex manifest, with a separate one-second budget by default. Failed probes are cached for 30 seconds; known reasoning levels survive. Account icon discovery no longer delays model discovery.
+- HTTP 401 invalidates queries for that credential scope and marks sign-in expired, without affecting other keys. Other required-query failures are not success-cached. Neither management queries nor billable inference requests automatically retry.
+- `diagnostics: true` emits fixed event names, protocols, timings, counts, cache hits and HTTP status codes. Logs contain no account/model names, site URLs, bodies or header values. Management errors do not echo upstream bodies, which might reflect credentials.
+
+## Request Metrics
+
+These six metrics are **Magpie request-level statistics**, distinct from remaining plan allowance returned by `/v1/usage`. The plugin returns the original `Response`, without pre-reading, cloning or buffering inference bodies. It does not post duplicate records to external usage-ingestion endpoints. Magpie measures the stream and reads upstream usage fields.
+
+| Metric | Source and meaning |
+| --- | --- |
+| Duration | Host-measured request start through completion/failure, not just time to HTTP headers |
+| First response | First effective output event recognized by the host, not connection time or SSE heartbeats |
+| Tokens | Upstream input/output, cache-read/write and reasoning counts, never character-count guesses |
+| Cache hit rate | Host-normalized cache reads / (uncached input + cache reads + cache writes); OpenAI input counts already include cache reads, whereas Anthropic `input_tokens` usually exclude them |
+| Output speed | Effective output tokens over the generation window after first output; hidden reasoning, unstreamed replies and bursts follow the host's rules |
+| Cost | Host estimate using effective provider/model prices and token tiers, not a promise of the site's actual charge or a wallet-balance delta |
+
+All four protocols preserve `usage` / `usageMetadata`, cache subdivisions, reasoning counts, final SSE usage events and upstream response headers unchanged. Streaming Chat Completions sites must support and return usage corresponding to `stream_options.include_usage`. Missing upstream usage cannot be reliably reconstructed. Cancelled, failed, non-streaming or unpriced requests may lack some metrics; missing is not fabricated as zero. Explicitly known zero cache hits or zero prices remain valid.
+
+Set `modelOverrides.<id>.cost` in **USD per million tokens**, providing all four prices: input, output, cache read and cache write. Use zero only for a confirmed free tier. Alternatively, use Magpie's provider/model price editor. For different prices of the same model at different sites, prefer separate site providers instead of an ambiguous pooled provider/model price. Custom upstream cost headers are preserved, but arbitrary nonstandard cost fields are not guaranteed to be recognized by the host.
+
+Magpie's metric definitions: <https://github.com/yetone/magpie/blob/main/docs/reference.md>. Repository tests verify transparent source data and streams; UI behavior still needs integration testing with the installed Magpie version.
+
 ## Testing
+
+In a Git source checkout, run `npm run hooks:install` once to enable the local commit hook. Ordinary `git commit` then increments the package patch version relative to HEAD and includes it in the same commit. An already-staged higher version is preserved, so retrying a failed commit does not bump twice. Use Chinese commit messages. Unstaged `package.json` edits abort the commit: review and stage the intended changes first. The hook stages no unrelated files, creates no extra commit and does not publish to npm or create tags. Enable it again for each clone; `--no-verify` bypasses it and is not for ordinary commits.
 
 ```sh
 npm run check
@@ -140,7 +254,7 @@ npm test
 npm pack --dry-run
 ```
 
-Tests require no dependencies, Docker or credentials. They cover usage conversion, discovery, header precedence, account isolation, all four conversational protocols, explicit model aliases, path rewriting, authentication, URL checks and failure handling, plus icon discovery, caching, size limits and credential isolation. Loopback HTTP tests check actual headers, SSE, cancellation, icon fetching and redirect rejection; they are explicitly skipped if local listening is prohibited.
+Tests require no dependencies, Docker or credentials. They cover usage conversion, full paginated catalogs, metadata preservation, header precedence, account isolation, all four conversational protocols, explicit aliases, path rewriting, authentication, URL checks, no-fallback failures, query caching/size/time limits and icon isolation. Speed tests verify unchanged wire model IDs, tier mapping, concurrency, prices, ID collisions, filters and no-downgrade failures. Metric tests preserve JSON/SSE usage, cache and reasoning tiers without pre-reading streams or fabricating free prices. Loopback HTTP tests check matching multi-key destinations/credentials, speed requests, actual headers, SSE, cancellation, icon fetching and redirect rejection; they explicitly skip if local listening is prohibited. CI runs checks, tests and package previews on Linux/macOS with Node.js 20/22/24.
 
 These tests do not replace live Magpie/Sub2API integration. Verify usage, model discovery and a model request in Magpie against your own site. Inspect custom headers only in logs you control, without logging credentials.
 
