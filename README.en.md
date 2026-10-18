@@ -34,7 +34,7 @@ With a configured site address, the plugin discovers the home page's `<link rel=
 - Home page and image requests send no API key, custom headers or cookies. Only the configured origin is contacted, without redirects, external CDNs or parent-domain discovery. Icons requiring authentication, redirects or cross-origin requests may be unavailable.
 - Each lookup shares a three-second timeout, a 512 KiB page limit, a 1 MiB image limit and a bounded candidate count. Successful lookups cache for one hour in memory; failures cache for five minutes, with retries on later configuration/model loads. Failed refreshes retain the last icon and never break models, usage or inference.
 
-This sets the **provider picture**. Magpie's marketplace/installed plugin card uses the static package-level `magpie.icon`; this plugin bundles the official Sub2API `image.png`, so the card does not change with account URLs. The image comes from the [official Sub2API repository](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg) and is distributed only as a brand asset, outside this project's MIT code license.
+This sets the **provider picture**. Magpie's marketplace/installed plugin card uses the static package-level `magpie.icon`; this plugin uses an embedded `data:image/…` URI of the official Sub2API SVG, so the card does not change with account URLs. `image.png` remains included for other clients. The artwork comes from the [official Sub2API repository](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg) and is distributed only as a brand asset, outside this project's MIT code license.
 
 ## Advanced Headers and Separate Sites
 

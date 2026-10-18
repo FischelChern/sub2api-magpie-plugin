@@ -71,7 +71,7 @@ https://api.example.com
 - 首页和图标请求不携带 API key、自定义请求头或 Cookie，仅访问所配置地址的相同 origin，不跟随重定向，不访问外部 CDN 或上级域名。需要认证、跳转或跨域加载的图标可能无法获取。
 - 每次发现共用 3 秒超时，首页最多 512 KiB，图片最多 1 MiB，并限制候选请求数。进程内成功缓存 1 小时、失败缓存 5 分钟，下次加载配置或模型时按需重试；刷新失败保留已有图标，不影响模型、用量和推理。
 
-这里设置的是 **provider 图片**。Magpie 插件市场或“已安装”插件卡片使用包级静态 `magpie.icon`；本插件已内置 Sub2API 官方 `image.png`，不会随账号地址动态切换。图标来源为 [Sub2API 官方仓库](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg)，仅作为品牌标识随插件分发，不属于本项目的 MIT 代码许可范围。
+这里设置的是 **provider 图片**。Magpie 插件市场或“已安装”插件卡片使用包级静态 `magpie.icon`；本插件使用 Sub2API 官方 SVG 的内嵌 `data:image/…` URI，不会随账号地址动态切换。`image.png` 同时随包保留，便于其他客户端使用。图标来源为 [Sub2API 官方仓库](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg)，仅作为品牌标识随插件分发，不属于本项目的 MIT 代码许可范围。
 
 ## 高级：自定义请求头
 

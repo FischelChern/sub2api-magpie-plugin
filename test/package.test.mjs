@@ -9,7 +9,8 @@ const PACKAGE = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"))
 
 test("package metadata exposes the bundled Sub2API icon", () => {
   assert.equal(PACKAGE.author, undefined)
-  assert.equal(PACKAGE.magpie.icon, "./image.png")
+  assert.match(PACKAGE.magpie.icon, /^(?:https:\/\/|data:image\/)/i)
+  assert.ok(Buffer.byteLength(PACKAGE.magpie.icon) <= 1024 * 1024)
   assert.ok(PACKAGE.files.includes("image.png"))
   assert.ok(existsSync(join(ROOT, "image.png")))
 })
