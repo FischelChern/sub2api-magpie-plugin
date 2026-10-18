@@ -4,7 +4,7 @@
 
 将 [Sub2API](https://github.com/Wei-Shaw/sub2api) 站点接入 [Magpie](https://usemagpie.ai)：查看当前 API key 对应的套餐、余额和模型，并在查询和模型发送请求中附加自定义请求头。
 
-本项目基于 [broven/magpie-sub2api](https://github.com/broven/magpie-sub2api) 0.2.1（MIT）扩展，新增分层请求头配置、安全校验和本地测试。使用 Magpie 的 provider 插件接口，无运行时依赖，无需构建；需要 Node.js >= 20。
+项目来源：`sub2api magpie`。本项目在此基础上重构，新增分层请求头配置、安全校验和本地测试。使用 Magpie 的 provider 插件接口，无运行时依赖，无需构建；需要 Node.js >= 20。
 
 ## 功能
 
@@ -71,7 +71,7 @@ https://api.example.com
 - 首页和图标请求不携带 API key、自定义请求头或 Cookie，仅访问所配置地址的相同 origin，不跟随重定向，不访问外部 CDN 或上级域名。需要认证、跳转或跨域加载的图标可能无法获取。
 - 每次发现共用 3 秒超时，首页最多 512 KiB，图片最多 1 MiB，并限制候选请求数。进程内成功缓存 1 小时、失败缓存 5 分钟，下次加载配置或模型时按需重试；刷新失败保留已有图标，不影响模型、用量和推理。
 
-这里设置的是 **provider 图片**。Magpie 插件市场或“已安装”插件卡片的图片使用包级静态 `magpie.icon`，不能随账号地址动态切换；本插件不为此改写 `package.json`。
+这里设置的是 **provider 图片**。Magpie 插件市场或“已安装”插件卡片使用包级静态 `magpie.icon`；本插件已内置 Sub2API 官方 `image.png`，不会随账号地址动态切换。图标来源为 [Sub2API 官方仓库](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg)，仅作为品牌标识随插件分发，不属于本项目的 MIT 代码许可范围。
 
 ## 高级：自定义请求头
 
@@ -101,7 +101,7 @@ https://api.example.com
 }
 ```
 
-协议请求头的优先级低于全局、站点和账号 `headers`，同名头仍由后者覆盖；账号也可在
+协议请求头的优先级低于全局、站点和账号 `headers`，同名配置仍由后者覆盖；账号也可在
 `metadata.protocolHeaders` 中单独配置。
 
 ### 全局和站点
@@ -137,13 +137,13 @@ magpie plugin login backup
 - 合并优先级：**全局 `headers` < 站点 `sites[].headers` < 账号元数据 `headers`**。
 - 同名 header 不区分大小写；后者覆盖前者，而不是拼接。
 - `sites[].headers` 仅属于该站点，不会应用到池化 provider 或其他站点。
-- 请求发送时再次强制应用合并结果，因此调用方不能覆盖你指定的 `User-Agent` 等请求头。
+- 合并后的配置只补充调用方未提供的同名请求头，不会覆盖 Agent 自带的请求头。
 - 账号请求头保存在 Magpie 认证元数据 `metadata.headers` 中，可为对象或 JSON 对象字符串；修改后需让 Magpie 重新加载账号。
 - 不做环境变量展开或模板替换，值按字面发送。敏感值不要提交到代码仓库，也不要直接写入会记录历史的终端命令。
 
 ### 自动 User-Agent
 
-实际模型请求按 API 协议设置以下兼容 `User-Agent`，覆盖 Magpie 或调用方传入的 UA（包括空字符串）。这些标识不是宿主实际安装的 SDK 版本：
+实际模型请求优先透传 Agent 自带的全部请求头，包括 `User-Agent`。只有调用方完全没有提供 UA 时，才按 API 协议补充以下兼容 `User-Agent`；这些标识不是宿主实际安装的 SDK 版本：
 
 | API 协议 | 默认 `User-Agent` |
 | --- | --- |
@@ -152,9 +152,9 @@ magpie plugin login backup
 | `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
 | `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
 
-选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。UA 优先级为 **调用方 UA < 协议默认 UA < protocolHeaders < 全局 headers < 站点 headers < 账号 headers**，同名头不区分大小写。要自动按协议切换 UA，请删除普通 `headers` 中旧的 `User-Agent` 覆盖；要为 Codex 和 Claude 分别指定 UA，请使用 `protocolHeaders.codex` / `protocolHeaders.claude`。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些默认标识，仍使用原有的自定义请求头。
+选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。调用方已有的请求头会原样保留，`protocolHeaders`、全局、站点和账号 `headers` 只补充缺失的同名头，认证头始终由当前账号接管。协议默认 UA 的补充顺序为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**，最终仍不会覆盖调用方已有的 `User-Agent`。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些默认标识，仍使用原有的自定义请求头。
 
-除 UA 和认证头等由插件管理的字段外，实际模型请求会透传调用方的其他请求头。Codex 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头保留；`init.headers` 中的同名值会覆盖 `Request.headers`，显式配置的协议、全局、站点或账号请求头仍具有更高优先级。
+实际模型请求会透传 Agent 提供的请求头。Codex 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头保留；`init.headers` 中的同名值会覆盖 `Request.headers`，显式配置的协议、全局、站点或账号请求头只补充缺失值。认证头不会透传调用方的错误值，而是替换为当前账号凭据。
 
 Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
 
@@ -183,7 +183,7 @@ Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请
   "protocol": "auto",
   "sites": [
     {
-      "id": "all-models",
+      "id": "all-models",··
       "name": "全部模型",
       "baseURL": "https://api.example.com",
       "protocol": "auto",
@@ -379,4 +379,4 @@ Magpie 插件接口文档：<https://github.com/yetone/magpie/blob/main/site/pub
 
 ## 许可证与来源
 
-代码基于 broven/magpie-sub2api 0.2.1，保留原作者 Randy (broven) 的 MIT 版权声明，见 [LICENSE](./LICENSE)。本地扩展沿用 MIT。不包含上游 Sub2API 图标，以避免与代码不同的图标许可证混用。运行时获取的网页图标仍归各站点或其权利人所有，不作为本包的 MIT 资源分发。
+代码使用 MIT 许可，见 [LICENSE](./LICENSE)。包内 `image.png` 来自 [Sub2API 官方 logo.svg](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg)，仅用于项目图标和品牌归属，不作为 MIT 代码许可的一部分。运行时获取的网页图标仍归各站点或其权利人所有，不作为本包的 MIT 资源分发。

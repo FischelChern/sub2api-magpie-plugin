@@ -1,12 +1,13 @@
 {
   "name": "sub2api-magpie-plugin",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Magpie provider for Sub2API: subscriptions, balance, models, four API protocols and custom request headers",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
   "files": [
     "index.mjs",
+    "image.png",
     "README.md",
     "README.en.md",
     "LICENSE",
@@ -25,12 +26,12 @@
     "sub2api",
     "provider"
   ],
-  "author": "Randy (broven)",
   "license": "MIT",
   "engines": {
     "node": ">=20"
   },
   "magpie": {
+    "icon": "./image.png",
     "options": {
       "protocol": "auto",
       "headers": {},

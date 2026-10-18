@@ -476,13 +476,19 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       headers.delete("content-length")
       report("inference.speed_migrated", { protocol })
     }
-    // Generic host identity must not override the selected protocol's identity.
-    if (protocol) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
     if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
       await codexMetadataHeaders(input, init, headers)
     }
-    for (const [name, value] of Object.entries(protocolExtra[protocol] ?? {})) headers.set(name, value)
-    for (const [name, value] of Object.entries(extra)) headers.set(name, value)
+    // Agent-provided headers are passed through unchanged. Configured headers
+    // fill missing values, while credential headers below remain enforced.
+    const configured = new Headers(extra)
+    new Headers(protocolExtra[protocol]).forEach((value, name) => {
+      if (!configured.has(name)) configured.set(name, value)
+    })
+    configured.forEach((value, name) => {
+      if (!headers.has(name)) headers.set(name, value)
+    })
+    if (protocol && !headers.has("user-agent")) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
     if (protocol === "anthropic" && !headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")
@@ -995,28 +1001,39 @@ function sitesOf(options, tell) {
 // hooks are one provider's: id, with its site fixed (a site from the
 // options) or each account's own (the "sub2api" provider's, asked at
 // sign-in).
-function hooks(client, id, site, options) {
-  const catalogs = new Map()
-  const expired = new Map()
-  const query = queries((scope, error) => { cacheSet(expired, scope, error) })
-  const configuredQuery = querySettings(options, site)
-  const queryFor = (auth) => querySettings({ query: configuredQuery }, auth?.metadata)
-  const configuredModels = validatePrices(modelSettings(options, site))
-  const modelsFor = (auth) => validatePrices(modelSettings(configuredModels, auth?.metadata))
-  diagnostics(options, site)
-  const reportFor = (auth) => diagnostics(options, site, auth?.metadata)
-  // Validate even overridden layers, so invalid config cannot silently drop a header.
-  const configured = mergedHeaders(options?.headers, site?.headers)
-  const headersOf = (auth) => mergedHeaders(configured, auth?.metadata?.headers)
-  const configuredRouting = routingOf(options, site)
-  const routingFor = (auth) => routingOf(configuredRouting, auth?.metadata)
-  const configuredProtocolHeaders = protocolHeadersOf(options, site)
-  const protocolHeadersFor = (auth) => protocolHeadersOf({ protocolHeaders: configuredProtocolHeaders }, auth?.metadata)
+// Normalize the static option/site layers once. Account metadata is applied
+// later, per request, so credentials and account-specific routing stay isolated.
+function pluginSettings(options, site) {
   const defaultURL = options?.url ?? options?.baseURL ?? options?.baseUrl
+  const settings = {
+    query: querySettings(options, site),
+    models: validatePrices(modelSettings(options, site)),
+    headers: mergedHeaders(options?.headers, site?.headers),
+    routing: routingOf(options, site),
+    protocolHeaders: protocolHeadersOf(options, site),
+    defaultURL,
+  }
   if (defaultURL !== undefined) {
     const bad = checkURL(defaultURL)
     if (bad) throw new Error(bad)
   }
+  return settings
+}
+
+function hooks(client, id, site, options) {
+  const catalogs = new Map()
+  const expired = new Map()
+  const query = queries((scope, error) => { cacheSet(expired, scope, error) })
+  const settings = pluginSettings(options, site)
+  const queryFor = (auth) => querySettings({ query: settings.query }, auth?.metadata)
+  const modelsFor = (auth) => validatePrices(modelSettings(settings.models, auth?.metadata))
+  diagnostics(options, site)
+  const reportFor = (auth) => diagnostics(options, site, auth?.metadata)
+  // Validate even overridden layers, so invalid config cannot silently drop a header.
+  const headersOf = (auth) => mergedHeaders(settings.headers, auth?.metadata?.headers)
+  const routingFor = (auth) => routingOf(settings.routing, auth?.metadata)
+  const protocolHeadersFor = (auth) => protocolHeadersOf({ protocolHeaders: settings.protocolHeaders }, auth?.metadata)
+  const { defaultURL } = settings
   const baseOf = (auth) => {
     const base = site?.base ?? root(auth?.metadata?.baseURL ?? auth?.metadata?.baseUrl ?? defaultURL)
     if (!base) return ""

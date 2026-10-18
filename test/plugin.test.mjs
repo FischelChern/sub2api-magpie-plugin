@@ -103,7 +103,7 @@ test("site providers are optional, keep fixed URLs and have isolated headers", a
   }
 })
 
-test("inference enforces configured headers and the selected key for all three APIs", async (t) => {
+test("inference passes through agent headers and enforces only the selected key", async (t) => {
   const plugin = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "configured", "X-Client": "magpie" } })
   const account = auth()
   const loader = await plugin.auth.loader(async () => account)
@@ -115,14 +115,14 @@ test("inference enforces configured headers and the selected key for all three A
     const body = '{"stream":true}'
     const actual = await loader.fetch(`${BASE}/v1/${path}`, {
       method: "POST", body, signal: controller.signal,
-      headers: { authorization: "Bearer wrong", "x-api-key": "wrong", "user-agent": "agent", "x-trace": "trace" },
+      headers: { authorization: "Bearer wrong", "x-api-key": "wrong", "user-agent": "agent", "x-client": "agent", "x-trace": "trace" },
     })
     assert.equal(actual, response)
     const { init } = calls.at(-1)
     assert.equal(init.headers.get("authorization"), `Bearer ${account.key}`)
     assert.equal(init.headers.get("x-api-key"), account.key)
-    assert.equal(init.headers.get("user-agent"), "configured")
-    assert.equal(init.headers.get("x-client"), "magpie")
+    assert.equal(init.headers.get("user-agent"), "agent")
+    assert.equal(init.headers.get("x-client"), "agent")
     assert.equal(init.headers.get("x-trace"), "trace")
     assert.equal(init.body, body)
     assert.equal(init.signal, controller.signal)
@@ -165,7 +165,7 @@ test("inference fills missing user agents by endpoint including rewritten paths 
   assert.equal(calls.length, count)
 })
 
-test("inference replaces host user agents by protocol including empty values and init overrides", async (t) => {
+test("inference preserves agent user agents and fills only missing values", async (t) => {
   const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
   const loader = await plugin.auth.loader(async () => auth())
   const calls = []
@@ -180,15 +180,15 @@ test("inference replaces host user agents by protocol including empty values and
     for (const userAgent of ["magpie/0.1.1271", "codex-tui/0.162.1", ""]) {
       for (const input of [url, new URL(url), new Request(url, { headers: { "User-Agent": "request-client" } })]) {
         await loader.fetch(input, { headers: { "uSeR-aGeNt": userAgent } })
-        assert.equal(calls.at(-1).get("user-agent"), expected)
+        assert.equal(calls.at(-1).get("user-agent"), userAgent)
       }
       await loader.fetch(new Request(url, { headers: { "User-Agent": userAgent } }))
-      assert.equal(calls.at(-1).get("user-agent"), expected)
+      assert.equal(calls.at(-1).get("user-agent"), userAgent)
     }
   }
 })
 
-test("inference preserves Codex identity and session headers except the protocol-managed user agent", async (t) => {
+test("inference preserves Codex identity, native user agent and session headers", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => auth())
   const calls = []
@@ -204,7 +204,7 @@ test("inference preserves Codex identity and session headers except the protocol
     "x-codex-source": "codex-tui",
   } })
   const headers = calls[0]
-  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
+  assert.equal(headers.get("user-agent"), "codex_cli_rs/0.162.0")
   assert.equal(headers.get("originator"), "codex_cli_rs")
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
@@ -252,7 +252,7 @@ test("Responses promotes existing Codex body metadata without changing the body 
     assert.equal(call.url, BASE + "/openai/v1/responses/compact", source)
     assert.equal(call.body, body, source)
     assert.equal(call.signal, controller.signal)
-    assert.equal(call.headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
+    assert.equal(call.headers.get("user-agent"), "magpie/test")
     assert.equal(call.headers.get("session-id"), metadata.session_id)
     assert.equal(call.headers.get("thread-id"), metadata.thread_id)
     for (const name of ["x-codex-window-id", "x-codex-installation-id", "x-codex-turn-metadata", "x-codex-source"]) {
@@ -263,7 +263,7 @@ test("Responses promotes existing Codex body metadata without changing the body 
   }
 })
 
-test("metadata only fills missing headers and configured protocol and account headers still win", async (t) => {
+test("metadata and configured headers only fill names missing from the agent request", async (t) => {
   const plugin = await plugins.Sub2apiSite1({}, {
     headers: { "User-Agent": "global" },
     protocolHeaders: { codex: { "User-Agent": "protocol", "x-codex-window-id": "protocol-window" } },
@@ -287,8 +287,8 @@ test("metadata only fills missing headers and configured protocol and account he
   assert.equal(headers.get("thread_id"), "request-thread")
   assert.equal(headers.has("thread-id"), false)
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
-  assert.equal(headers.get("x-codex-window-id"), "protocol-window")
-  assert.equal(headers.get("x-codex-installation-id"), "account-installation")
+  assert.equal(headers.get("x-codex-window-id"), "body-window")
+  assert.equal(headers.get("x-codex-installation-id"), "body-installation")
 })
 
 test("Codex body metadata is not promoted on other protocols or management endpoints", async (t) => {
@@ -442,7 +442,7 @@ test("inference applies protocol-specific Codex and Claude headers", async (t) =
   assert.equal(calls[1].get("originator"), null)
 })
 
-test("explicit user agents override protocol defaults with isolated global site and account precedence", async (t) => {
+test("agent user agents pass through while configured values remain isolated", async (t) => {
   const options = {
     headers: { "USER-AGENT": "global" },
     sites: [{ id: "work", url: BASE, headers: { "User-Agent": "site" } }],
@@ -453,14 +453,14 @@ test("explicit user agents override protocol defaults with isolated global site 
   t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
   const accountLoader = await site.auth.loader(async () => auth({ headers: '{"uSeR-aGeNt":"account"}' }, "sk-account"))
   for (const [plugin, metadata, expected] of [
-    [pooled, {}, "global"], [site, {}, "site"], [site, { headers: { "user-agent": "" } }, ""],
+    [pooled, {}], [site, {}], [site, { headers: { "user-agent": "" } }],
   ]) {
     const loader = await plugin.auth.loader(async () => auth(metadata, "sk-other"))
     for (const path of ["responses", "messages", "chat/completions", "models/gemini-test:generateContent"]) {
       await accountLoader.fetch(BASE + "/v1/" + path)
       await loader.fetch(BASE + "/v1/" + path, { headers: { "user-agent": "caller" } })
       await accountLoader.fetch(BASE + "/v1/" + path)
-      assert.deepEqual(calls.slice(-3).map((h) => h.get("user-agent")), ["account", expected, "account"])
+      assert.deepEqual(calls.slice(-3).map((h) => h.get("user-agent")), ["account", "caller", "account"])
       assert.deepEqual(calls.slice(-3).map((h) => h.get("authorization")), ["Bearer sk-account", "Bearer sk-other", "Bearer sk-account"])
     }
   }

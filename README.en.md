@@ -4,7 +4,7 @@
 
 Connect a [Sub2API](https://github.com/Wei-Shaw/sub2api) site to [Magpie](https://usemagpie.ai). Display the current API key's plan, usage, balance and models, and attach configurable headers to discovery, usage and model requests.
 
-Based on [broven/magpie-sub2api](https://github.com/broven/magpie-sub2api) 0.2.1 (MIT), with layered headers, validation and local tests added. No build or runtime dependencies. Node.js >= 20.
+Project source: `sub2api magpie`. This project is refactored from that provider with layered headers, validation and local tests. No build or runtime dependencies. Node.js >= 20.
 
 ## Local Installation
 
@@ -34,7 +34,7 @@ With a configured site address, the plugin discovers the home page's `<link rel=
 - Home page and image requests send no API key, custom headers or cookies. Only the configured origin is contacted, without redirects, external CDNs or parent-domain discovery. Icons requiring authentication, redirects or cross-origin requests may be unavailable.
 - Each lookup shares a three-second timeout, a 512 KiB page limit, a 1 MiB image limit and a bounded candidate count. Successful lookups cache for one hour in memory; failures cache for five minutes, with retries on later configuration/model loads. Failed refreshes retain the last icon and never break models, usage or inference.
 
-This sets the **provider picture**. Magpie's marketplace/installed plugin card uses the static package-level `magpie.icon`, which cannot follow account URLs dynamically; this plugin does not rewrite `package.json` to change that card.
+This sets the **provider picture**. Magpie's marketplace/installed plugin card uses the static package-level `magpie.icon`; this plugin bundles the official Sub2API `image.png`, so the card does not change with account URLs. The image comes from the [official Sub2API repository](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg) and is distributed only as a brand asset, outside this project's MIT code license.
 
 ## Advanced Headers and Separate Sites
 
@@ -77,9 +77,9 @@ magpie plugin login primary
 
 The same JSON can be entered in Magpie's plugin options editor. A site provider uses its fixed URL; its models are named `primary/<model>`. The pooled `sub2api` provider remains available. Up to eight independent sites are supported.
 
-Header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The final merged headers are enforced in the account's fetch function, so callers cannot override them. Values are literal; environment expansion and templates are not supported.
+Configured-header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The merged configuration only fills names not supplied by the caller, so it does not replace the agent's own headers. Values are literal; environment expansion and templates are not supported.
 
-Inference sets a protocol-specific compatibility `User-Agent`, replacing Magpie's or the caller's UA, including an empty value. These identifiers are not the SDK versions installed by the host:
+Inference forwards all headers supplied by the agent, including its `User-Agent`. Only when the caller supplies no UA does the plugin add a protocol-specific compatibility `User-Agent`. These identifiers are not the SDK versions installed by the host:
 
 | API protocol | Default `User-Agent` |
 | --- | --- |
@@ -88,9 +88,9 @@ Inference sets a protocol-specific compatibility `User-Agent`, replacing Magpie'
 | `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
 | `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
 
-Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. UA precedence is **caller UA < protocol default UA < protocolHeaders < global headers < site headers < account headers**, case-insensitively. Remove any old `User-Agent` override from ordinary `headers` to switch automatically by protocol; use `protocolHeaders.codex` / `protocolHeaders.claude` for separate explicit UAs. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these defaults and keep their existing custom headers.
+Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Caller-provided headers are preserved; explicit `protocolHeaders`, global, site and account `headers` only fill missing names, while authentication headers are always owned by the selected account. Fallback UA precedence is **built-in protocol default < `protocolHeaders` < global `headers` < site `headers` < account `headers`**, and it still never replaces a caller-provided `User-Agent`. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these defaults and keep their existing custom headers.
 
-Except for plugin-managed fields such as UA and authentication, inference forwards the caller's other request headers. Codex's `originator`, `session-id` and all `x-codex-*` headers are preserved; duplicate values in `init.headers` override `Request.headers`, while explicitly configured protocol, global, site or account headers still have higher precedence.
+Inference forwards the agent's request headers. Codex's `originator`, `session-id` and all `x-codex-*` headers are preserved; duplicate values in `init.headers` override `Request.headers`, while explicitly configured protocol, global, site or account headers only fill missing names. Caller-supplied authentication headers are replaced with the selected account's credentials.
 
 Responses requests also fill missing headers from the JSON body's `client_metadata`: `session_id` becomes `session-id`, `thread_id` becomes `thread-id`, and string-valued `x-codex-*` fields keep their names. Existing headers, including `session_id` / `thread_id` aliases, win. No other arbitrary fields are copied, no installation/window/session identifiers are generated, and the body is unchanged. This conversion does not apply to Claude, Chat Completions, Gemini or management endpoints.
 
@@ -268,4 +268,4 @@ Plugin API reference: <https://github.com/yetone/magpie/blob/main/site/public/do
 
 ## License and Attribution
 
-Based on broven/magpie-sub2api 0.2.1 by Randy (broven), under MIT. The original copyright notice is retained in [LICENSE](./LICENSE); local extensions use MIT as well. The upstream Sub2API icon is not included because its license differs from the code's. Site icons fetched at runtime remain the property of their respective owners and are not distributed as MIT assets in this package.
+The code is distributed under the MIT license in [LICENSE](./LICENSE). The bundled `image.png` is derived from the [official Sub2API logo.svg](https://github.com/Wei-Shaw/sub2api/blob/main/assets/logo.svg) and is included only as a project-brand asset, not as MIT-licensed code. Site icons fetched at runtime remain the property of their respective owners and are not distributed as MIT assets in this package.
