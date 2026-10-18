@@ -79,20 +79,24 @@ The same JSON can be entered in Magpie's plugin options editor. A site provider 
 
 Configured-header precedence is **global < site < account**, case-insensitively. Advanced account headers are stored as `metadata.headers` (an object or JSON object string); they are no longer a sign-in prompt. Site headers do not apply to other sites or pooled accounts. The merged configuration only fills names not supplied by the caller, so it does not replace the agent's own headers. Values are literal; environment expansion and templates are not supported.
 
-Inference forwards all headers supplied by the agent, including its `User-Agent`. Only when the caller supplies no UA does the plugin add a protocol-specific compatibility `User-Agent`. These identifiers are not the SDK versions installed by the host:
+### Automatic User-Agent and client identity
 
-| API protocol | Default `User-Agent` |
+Magpie sends inference through a plugin provider with its own `magpie/<version>` User-Agent instead of handing the plugin Codex's or Claude Code's original UA. The plugin therefore recognizes and replaces Magpie's own `magpie/*` and `magpie-*` values so they never reach a model upstream; recognizable Codex/Claude agent markers select the matching UA when present. A real non-Magpie agent UA that does reach the plugin is preserved unchanged.
+
+When no usable agent UA is available, the plugin supplies this protocol-compatible identity. These versions identify the client; they are not the SDK versions installed by the host:
+
+| API protocol | Automatic `User-Agent` |
 | --- | --- |
-| `responses` (default for GPT / Codex) | `codex_cli_rs/0.146.0 (sub2api-magpie-plugin)` |
-| `chat-completions` | `OpenAI/JS (sub2api-magpie-plugin)` |
-| `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
-| `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
+| `responses` (default for GPT / Codex) | `codex_cli_rs/0.159.0 (<OS>; <arch>) <terminal>` |
+| `anthropic` (default for Claude) | `claude-cli/2.1.296 (external, cli)` |
+| `chat-completions` | `OpenAI/JS` |
+| `gemini` | `google-genai-sdk` |
 
-Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. Caller-provided headers are preserved; explicit `protocolHeaders`, global, site and account `headers` only fill missing names, while authentication headers are always owned by the selected account. Fallback UA precedence is **built-in protocol default < `protocolHeaders` < global `headers` < site `headers` < account `headers`**, and it still never replaces a caller-provided `User-Agent`. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these defaults and keep their existing custom headers.
+Selection follows the actual request's API type rather than re-parsing the model name, including `modelProtocols` overrides and custom `apiPaths`. An explicit valid non-Magpie `User-Agent` replaces the internal Magpie UA, but does not override a real non-Magpie agent UA. Configured precedence is **built-in protocol default < `protocolHeaders` < global `headers` < site `headers` < account `headers`**. Usage, model discovery, Codex reasoning-level queries and unrecognized endpoints do not receive these inference defaults.
 
-Inference forwards the agent's request headers. Codex's `originator`, `session-id` and all `x-codex-*` headers are preserved; duplicate values in `init.headers` override `Request.headers`, while explicitly configured protocol, global, site or account headers only fill missing names. Caller-supplied authentication headers are replaced with the selected account's credentials.
+Responses requests also fill Codex client headers: `OpenAI-Beta: responses=experimental`, `originator: codex_cli_rs` and `version`. A higher caller-supplied `version` is kept and included in the UA. Claude requests gain `x-app: cli` and, when missing, `anthropic-version: 2023-06-01`. Agent-supplied `originator`, `session-id` and all `x-codex-*` headers remain intact; duplicate values in `init.headers` override `Request.headers`, while authentication headers are always owned by the selected account.
 
-Responses requests also fill missing headers from the JSON body's `client_metadata`: `session_id` becomes `session-id`, `thread_id` becomes `thread-id`, and string-valued `x-codex-*` fields keep their names. Existing headers, including `session_id` / `thread_id` aliases, win. No other arbitrary fields are copied, no installation/window/session identifiers are generated, and the body is unchanged. This conversion does not apply to Claude, Chat Completions, Gemini or management endpoints.
+Responses requests also fill missing headers from the JSON body's `client_metadata`: `session_id` becomes `session-id`, `thread_id` becomes `thread-id`, and string-valued `x-codex-*` fields keep their names. As in Magpie's Codex signing, `prompt_cache_key` fills a missing `session-id` and `thread-id`. Existing headers, including `session_id` / `thread_id` aliases, win. No other arbitrary fields are copied, no installation/window/session identifiers are generated, and the body is unchanged. This conversion does not apply to Claude, Chat Completions, Gemini or management endpoints.
 
 Metadata inspection supports strings, bytes, Blobs and a cloned `Request`, reading at most 1 MiB. Clone reads wait at most 15 seconds and honor cancellation. Direct `ReadableStream` uploads in `init.body`, encoded bodies and oversized bodies are passed to fetch without conversion; existing HTTP headers are still preserved. Invalid JSON or header values are ignored, and added metadata headers are capped at 8 KiB in total. These headers can contain client, session and local workspace information; send them only to trusted providers and remove unwanted metadata at the caller.
 

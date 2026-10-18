@@ -141,22 +141,24 @@ magpie plugin login backup
 - 账号请求头保存在 Magpie 认证元数据 `metadata.headers` 中，可为对象或 JSON 对象字符串；修改后需让 Magpie 重新加载账号。
 - 不做环境变量展开或模板替换，值按字面发送。敏感值不要提交到代码仓库，也不要直接写入会记录历史的终端命令。
 
-### 自动 User-Agent
+### 自动 User-Agent 与客户端标识
 
-实际模型请求优先透传 Agent 自带的全部请求头，包括 `User-Agent`。只有调用方完全没有提供 UA 时，才按 API 协议补充以下兼容 `User-Agent`；这些标识不是宿主实际安装的 SDK 版本：
+Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<version>` User-Agent，而不是把 Codex、Claude Code 等 Agent 的原始 UA 交给插件。插件会识别并替换 Magpie 自己的 `magpie/*`、`magpie-*` UA，避免它被发送到模型上游；若请求中带有可识别的 Codex/Claude Agent 标记，则优先选择对应 UA。若插件实际收到的是非 Magpie 的 Agent UA，则原样保留。
 
-| API 协议 | 默认 `User-Agent` |
+没有可用的 Agent UA 时，插件按实际 API 协议补充以下兼容标识；这些版本用于客户端识别，不代表宿主安装的 SDK 版本：
+
+| API 协议 | 自动 `User-Agent` |
 | --- | --- |
-| `responses`（GPT / Codex 默认） | `codex_cli_rs/0.146.0 (sub2api-magpie-plugin)` |
-| `chat-completions` | `OpenAI/JS (sub2api-magpie-plugin)` |
-| `anthropic` | `anthropic-typescript (sub2api-magpie-plugin)` |
-| `gemini` | `google-genai-sdk (sub2api-magpie-plugin)` |
+| `responses`（GPT / Codex 默认） | `codex_cli_rs/0.159.0 (<OS>; <arch>) <terminal>` |
+| `anthropic`（Claude 默认） | `claude-cli/2.1.296 (external, cli)` |
+| `chat-completions` | `OpenAI/JS` |
+| `gemini` | `google-genai-sdk` |
 
-选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。调用方已有的请求头会原样保留，`protocolHeaders`、全局、站点和账号 `headers` 只补充缺失的同名头，认证头始终由当前账号接管。协议默认 UA 的补充顺序为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**，最终仍不会覆盖调用方已有的 `User-Agent`。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些默认标识，仍使用原有的自定义请求头。
+选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。若显式 `User-Agent` 配置有效且不是 Magpie 自身 UA，它会替换内部 Magpie UA，但不会覆盖真实的非 Magpie Agent UA。配置优先级为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些推理默认值。
 
-实际模型请求会透传 Agent 提供的请求头。Codex 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头保留；`init.headers` 中的同名值会覆盖 `Request.headers`，显式配置的协议、全局、站点或账号请求头只补充缺失值。认证头不会透传调用方的错误值，而是替换为当前账号凭据。
+Responses 请求还会补齐 Codex 客户端头：`OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`。调用方给出的更高 `version` 会保留并使用在 UA 中。Claude 请求缺失时补充 `x-app: cli` 和 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
 
-Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
+Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
 
 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最多读取 1 MiB；副本读取最多等待 15 秒，并响应取消信号。直接通过 `init.body` 传入的 `ReadableStream`、编码后的请求体及过大的请求体不做转换，原样交给 fetch；已提供的 HTTP 头仍保留。无效 JSON 或头值会忽略，新增元数据请求头合计最多 8 KiB。这些头可能包含客户端、会话和本地工作区信息，只应发送给可信供应商；若无需转发某项，请在调用方移除对应元数据。
 

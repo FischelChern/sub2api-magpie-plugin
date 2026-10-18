@@ -31,12 +31,25 @@ const RESPONSES = "@ai-sdk/openai"
 const GEMINI = "@ai-sdk/google"
 const PROTOCOLS = { anthropic: MESSAGES, responses: RESPONSES, "chat-completions": CHAT, gemini: GEMINI }
 const DEFAULT_PATHS = { anthropic: "/v1", responses: "/v1", "chat-completions": "/v1", gemini: "/v1beta" }
-// Compatibility identifiers, not the SDK versions installed by the host.
+// Magpie normally gives a plugin provider its own magpie/<version> UA. These
+// fallbacks identify the protocol's agent instead, as the built-in providers do.
+const CODEX_VERSION = "0.159.0"
+const CLAUDE_CLI_VERSION = "2.1.296"
 const PROTOCOL_USER_AGENTS = {
-  anthropic: "anthropic-typescript (sub2api-magpie-plugin)",
-  responses: "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)",
-  "chat-completions": "OpenAI/JS (sub2api-magpie-plugin)",
-  gemini: "google-genai-sdk (sub2api-magpie-plugin)",
+  anthropic: `claude-cli/${CLAUDE_CLI_VERSION} (external, cli)`,
+  responses: `codex_cli_rs/${CODEX_VERSION} (${agentPlatform()}; ${agentArch()}) ${agentTerminal()}`,
+  "chat-completions": "OpenAI/JS",
+  gemini: "google-genai-sdk",
+}
+const PROTOCOL_IDENTITY_HEADERS = {
+  responses: {
+    "openai-beta": "responses=experimental",
+    originator: "codex_cli_rs",
+    version: CODEX_VERSION,
+  },
+  anthropic: {
+    "x-app": "cli",
+  },
 }
 const TIMEOUT = 15_000
 const METADATA_BODY_MAX = 1 << 20
@@ -59,6 +72,65 @@ const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
 const HOUR = 3600
 const DAY = 24 * HOUR
 const SPANS = { "5h": ["5 hours", 5 * HOUR], "1d": ["24 hours", DAY], "7d": ["7 days", 7 * DAY] }
+
+function agentPlatform() {
+  if (process.platform === "darwin") return "Mac OS"
+  if (process.platform === "win32") return "Windows"
+  return "Linux"
+}
+
+function agentArch() {
+  return process.arch === "x64" ? "x86_64" : process.arch
+}
+
+function agentTerminal() {
+  if (process.platform === "darwin") return "Apple_Terminal/455"
+  if (process.platform === "win32") return "WindowsTerminal"
+  return "xterm-256color"
+}
+
+function isMagpieUserAgent(value) {
+  return /^magpie(?:[/-]|$)/i.test(String(value ?? "").trim())
+}
+
+function newerVersion(supplied, fallback = CODEX_VERSION) {
+  if (!/^\d+(?:\.\d+){1,3}$/.test(supplied)) return fallback
+  const a = supplied.split(".").map(Number)
+  const b = fallback.split(".").map(Number)
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const left = a[i] ?? 0
+    const right = b[i] ?? 0
+    if (left !== right) return left > right ? supplied : fallback
+  }
+  return fallback
+}
+
+function codexUserAgent(headers) {
+  const version = newerVersion(String(headers.get("version") ?? "").trim())
+  return `codex_cli_rs/${version} (${agentPlatform()}; ${agentArch()}) ${agentTerminal()}`
+}
+
+function callingAgent(headers) {
+  const named = String(headers.get("x-magpie-agent") ?? "").trim().toLowerCase()
+  if (named === "codex" || named === "claude") return named
+  const userAgent = String(headers.get("user-agent") ?? "").trim().toLowerCase()
+  if (/^(codex|codex_cli_rs|codex_exec|codex_vscode|acp-extension-codex)/.test(userAgent)) return "codex"
+  if (/^claude-cli\//.test(userAgent) || userAgent.includes("claude code")) return "claude"
+  const originator = String(headers.get("originator") ?? "").trim().toLowerCase()
+  if (/^(codex|acp-extension-codex)/.test(originator)) return "codex"
+  for (const name of headers.keys()) {
+    if (name.startsWith("x-codex-") || name === "x-openai-subagent") return "codex"
+    if (name.startsWith("x-claude-code-") || name === "x-anthropic-billing-header") return "claude"
+  }
+  return ""
+}
+
+function fallbackUserAgent(protocol, headers) {
+  const agent = callingAgent(headers)
+  if (agent === "codex") return codexUserAgent(headers)
+  if (agent === "claude") return PROTOCOL_USER_AGENTS.anthropic
+  return PROTOCOL_USER_AGENTS[protocol]
+}
 
 function fingerprint(...parts) {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex")
@@ -395,26 +467,37 @@ async function metadataBody(input, init) {
 }
 
 async function codexMetadataHeaders(input, init, headers) {
-  let metadata
+  let payload
   try {
-    metadata = JSON.parse(await metadataBody(input, init))?.client_metadata
+    payload = JSON.parse(await metadataBody(input, init))
   } catch {
     return
   }
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return
   let size = 0
-  for (const [field, value] of Object.entries(metadata)) {
-    const name = field === "session_id" ? "session-id" : field === "thread_id" ? "thread-id" : field
-    if (!["session-id", "thread-id"].includes(name) && !/^x-codex-[!#$%&'*+.^_`|~0-9A-Za-z-]+$/i.test(name)) continue
-    if (headers.has(name) || headers.has(name.replace(/-/g, "_"))) continue
-    if (typeof value !== "string" || !value.trim()) continue
+  const setMissing = (name, value) => {
+    if (headers.has(name) || headers.has(name.replace(/-/g, "_"))) return
+    if (typeof value !== "string" || !value.trim()) return
     const length = name.length + value.length + 4
-    if (size + length > METADATA_HEADERS_MAX) continue
+    if (size + length > METADATA_HEADERS_MAX) return
     // Body metadata is untrusted too; ignore invalid values without logging them.
     try {
       for (const [key, val] of Object.entries(customHeaders({ [name]: value }))) headers.set(key, val)
       size += length
     } catch {}
+  }
+  const metadata = payload.client_metadata
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    for (const [field, value] of Object.entries(metadata)) {
+      const name = field === "session_id" ? "session-id" : field === "thread_id" ? "thread-id" : field
+      if (!["session-id", "thread-id"].includes(name) && !/^x-codex-[!#$%&'*+.^_`|~0-9A-Za-z-]+$/i.test(name)) continue
+      setMissing(name, value)
+    }
+  }
+  // Magpie's Codex signing uses prompt_cache_key as both conversation IDs.
+  if (typeof payload.prompt_cache_key === "string" && payload.prompt_cache_key.trim()) {
+    setMissing("session-id", payload.prompt_cache_key)
+    setMissing("thread-id", payload.prompt_cache_key)
   }
 }
 
@@ -479,16 +562,29 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
       await codexMetadataHeaders(input, init, headers)
     }
-    // Agent-provided headers are passed through unchanged. Configured headers
-    // fill missing values, while credential headers below remain enforced.
-    const configured = new Headers(extra)
-    new Headers(protocolExtra[protocol]).forEach((value, name) => {
-      if (!configured.has(name)) configured.set(name, value)
-    })
+    // Built-in identity < protocol headers < global/site/account headers.
+    // Agent-provided headers still win, except Magpie's own UA, which a plugin
+    // provider is given instead of the calling agent's and must not forward.
+    const configured = new Headers(PROTOCOL_IDENTITY_HEADERS[protocol])
+    new Headers(protocolExtra[protocol]).forEach((value, name) => configured.set(name, value))
+    new Headers(extra).forEach((value, name) => configured.set(name, value))
     configured.forEach((value, name) => {
-      if (!headers.has(name)) headers.set(name, value)
+      if (name !== "user-agent" && !headers.has(name)) headers.set(name, value)
     })
-    if (protocol && !headers.has("user-agent")) headers.set("user-agent", PROTOCOL_USER_AGENTS[protocol])
+    if (protocol === "responses") {
+      const version = String(headers.get("version") ?? "").trim()
+      const selected = newerVersion(version)
+      if (selected !== version) headers.set("version", selected)
+    }
+    const requestedUA = String(headers.get("user-agent") ?? "").trim()
+    const configuredUA = String(configured.get("user-agent") ?? "").trim()
+    if (protocol && (!requestedUA || isMagpieUserAgent(requestedUA))) {
+      headers.set("user-agent", configuredUA && !isMagpieUserAgent(configuredUA) ? configuredUA : fallbackUserAgent(protocol, headers))
+    } else if (!requestedUA && configuredUA && !isMagpieUserAgent(configuredUA)) {
+      headers.set("user-agent", configuredUA)
+    }
+    headers.delete("x-magpie-agent")
+    headers.delete("x-magpie-via")
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
     if (protocol === "anthropic" && !headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")

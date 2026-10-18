@@ -6,6 +6,8 @@ import test from "node:test"
 import * as plugins from "../index.mjs"
 
 const BASE = "https://api.example.com"
+const CODEX_UA = /^codex_cli_rs\/0\.159\.0 \([^;]+; [^)]+\) \S+$/
+const CLAUDE_UA = "claude-cli/2.1.296 (external, cli)"
 const auth = (metadata = {}, key = "sk-test-only-1234") => ({
   type: "api", key, metadata: { baseURL: BASE, ...metadata },
 })
@@ -137,12 +139,12 @@ test("inference fills missing user agents by endpoint including rewritten paths 
   const response = json({})
   t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return response })
   for (const [path, userAgent] of [
-    ["/v1/responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
-    ["/openai/v1/responses/compact", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
-    ["/v1/chat/completions", "OpenAI/JS (sub2api-magpie-plugin)"],
-    ["/v1/messages", "anthropic-typescript (sub2api-magpie-plugin)"],
-    ["/v1beta/models/gemini-test:streamGenerateContent", "google-genai-sdk (sub2api-magpie-plugin)"],
-    ["/v1/responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
+    ["/v1/responses", CODEX_UA],
+    ["/openai/v1/responses/compact", CODEX_UA],
+    ["/v1/chat/completions", "OpenAI/JS"],
+    ["/v1/messages", CLAUDE_UA],
+    ["/v1beta/models/gemini-test:streamGenerateContent", "google-genai-sdk"],
+    ["/v1/responses", CODEX_UA],
   ]) {
     for (const kind of ["string", "URL", "Request"]) {
       const url = BASE + "/prefix" + path
@@ -150,7 +152,8 @@ test("inference fills missing user agents by endpoint including rewritten paths 
         : kind === "URL" ? new URL(url) : url
       assert.equal(await loader.fetch(input), response)
       const call = calls.at(-1)
-      assert.equal(call.init.headers.get("user-agent"), userAgent)
+      if (userAgent instanceof RegExp) assert.match(call.init.headers.get("user-agent"), userAgent)
+      else assert.equal(call.init.headers.get("user-agent"), userAgent)
       assert.equal(call.init.headers.get("authorization"), `Bearer ${auth().key}`)
       assert.equal(call.init.redirect, "error")
       if (path === "/v1/responses") {
@@ -159,32 +162,73 @@ test("inference fills missing user agents by endpoint including rewritten paths 
     }
   }
   await loader.fetch(BASE + "/prefix/v1/responses")
-  assert.equal(calls.at(-1).init.headers.get("user-agent"), "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)")
+  assert.match(calls.at(-1).init.headers.get("user-agent"), CODEX_UA)
   const count = calls.length
   await assert.rejects(loader.fetch("https://other.example.com/prefix/v1/responses"), /Refusing/)
   assert.equal(calls.length, count)
 })
 
-test("inference preserves agent user agents and fills only missing values", async (t) => {
+test("inference preserves real agent user agents and replaces Magpie's own", async (t) => {
   const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
   const loader = await plugin.auth.loader(async () => auth())
   const calls = []
   t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
   for (const [path, expected] of [
-    ["responses", "codex_cli_rs/0.146.0 (sub2api-magpie-plugin)"],
-    ["messages", "anthropic-typescript (sub2api-magpie-plugin)"],
-    ["chat/completions", "OpenAI/JS (sub2api-magpie-plugin)"],
-    ["models/gemini-test:generateContent", "google-genai-sdk (sub2api-magpie-plugin)"],
+    ["responses", CODEX_UA],
+    ["messages", CLAUDE_UA],
+    ["chat/completions", "OpenAI/JS"],
+    ["models/gemini-test:generateContent", "google-genai-sdk"],
   ]) {
     const url = BASE + "/v1/" + path
-    for (const userAgent of ["magpie/0.1.1271", "codex-tui/0.162.1", ""]) {
-      for (const input of [url, new URL(url), new Request(url, { headers: { "User-Agent": "request-client" } })]) {
-        await loader.fetch(input, { headers: { "uSeR-aGeNt": userAgent } })
-        assert.equal(calls.at(-1).get("user-agent"), userAgent)
-      }
-      await loader.fetch(new Request(url, { headers: { "User-Agent": userAgent } }))
-      assert.equal(calls.at(-1).get("user-agent"), userAgent)
+    for (const input of [url, new URL(url)]) {
+      await loader.fetch(input, { headers: { "uSeR-aGeNt": "magpie/0.1.1271" } })
+      if (expected instanceof RegExp) assert.match(calls.at(-1).get("user-agent"), expected)
+      else assert.equal(calls.at(-1).get("user-agent"), expected)
+      await loader.fetch(input, { headers: { "uSeR-aGeNt": "" } })
+      if (expected instanceof RegExp) assert.match(calls.at(-1).get("user-agent"), expected)
+      else assert.equal(calls.at(-1).get("user-agent"), expected)
     }
+    await loader.fetch(new Request(url, { headers: { "User-Agent": "codex-tui/0.162.1" } }))
+    assert.equal(calls.at(-1).get("user-agent"), "codex-tui/0.162.1")
+    await loader.fetch(new Request(url, { headers: { "User-Agent": "magpie/0.1.1271" } }))
+    if (expected instanceof RegExp) assert.match(calls.at(-1).get("user-agent"), expected)
+    else assert.equal(calls.at(-1).get("user-agent"), expected)
+  }
+})
+
+test("configured user agent replaces Magpie's own without overriding a real agent", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "configured-client/1.0" } })
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  await loader.fetch(BASE + "/v1/responses", { headers: { "User-Agent": "magpie/0.1.1271" } })
+  assert.equal(calls.at(-1).get("user-agent"), "configured-client/1.0")
+  await loader.fetch(BASE + "/v1/messages", { headers: { "User-Agent": "claude-cli/2.1.300 (external, cli)" } })
+  assert.equal(calls.at(-1).get("user-agent"), "claude-cli/2.1.300 (external, cli)")
+  await loader.fetch(BASE + "/v1/responses", { headers: { "User-Agent": "magpie-test" } })
+  assert.equal(calls.at(-1).get("user-agent"), "configured-client/1.0")
+
+  const protocol = await plugins.Sub2apiPlugin({}, { protocolHeaders: { claude: { "User-Agent": "claude-protocol/1.0" } } })
+  const protocolLoader = await protocol.auth.loader(async () => auth())
+  await protocolLoader.fetch(BASE + "/v1/messages", { headers: { "User-Agent": "magpie/0.1.1271" } })
+  assert.equal(calls.at(-1).get("user-agent"), "claude-protocol/1.0")
+})
+
+test("Magpie agent labels select matching UAs and never reach upstream", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  for (const [path, agent, expected] of [
+    ["chat/completions", "codex", CODEX_UA],
+    ["models/gemini-test:generateContent", "claude", CLAUDE_UA],
+  ]) {
+    await loader.fetch(BASE + "/v1/" + path, {
+      headers: { "User-Agent": "magpie/0.1.1271", "X-Magpie-Agent": agent },
+    })
+    if (expected instanceof RegExp) assert.match(calls.at(-1).get("user-agent"), expected)
+    else assert.equal(calls.at(-1).get("user-agent"), expected)
+    assert.equal(calls.at(-1).has("x-magpie-agent"), false)
   }
 })
 
@@ -252,15 +296,38 @@ test("Responses promotes existing Codex body metadata without changing the body 
     assert.equal(call.url, BASE + "/openai/v1/responses/compact", source)
     assert.equal(call.body, body, source)
     assert.equal(call.signal, controller.signal)
-    assert.equal(call.headers.get("user-agent"), "magpie/test")
+    assert.match(call.headers.get("user-agent"), CODEX_UA)
+    assert.equal(call.headers.get("openai-beta"), "responses=experimental")
+    assert.equal(call.headers.get("version"), "0.159.0")
     assert.equal(call.headers.get("session-id"), metadata.session_id)
     assert.equal(call.headers.get("thread-id"), metadata.thread_id)
     for (const name of ["x-codex-window-id", "x-codex-installation-id", "x-codex-turn-metadata", "x-codex-source"]) {
       assert.equal(call.headers.get(name), metadata[name])
     }
     assert.equal(call.headers.get("authorization"), `Bearer ${auth().key}`)
-    for (const name of ["x-api-key", "x-other", "turn_id", "originator"]) assert.equal(call.headers.has(name), false)
+    assert.equal(call.headers.get("originator"), "codex_cli_rs")
+    for (const name of ["x-api-key", "x-other", "turn_id"]) assert.equal(call.headers.has(name), false)
   }
+})
+
+test("Responses uses prompt_cache_key for missing Codex session headers", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  await loader.fetch(BASE + "/v1/responses", {
+    method: "POST",
+    body: JSON.stringify({ prompt_cache_key: "cache-session" }),
+  })
+  assert.equal(calls.at(-1).get("session-id"), "cache-session")
+  assert.equal(calls.at(-1).get("thread-id"), "cache-session")
+  await loader.fetch(BASE + "/v1/responses", {
+    method: "POST",
+    headers: { "session-id": "explicit-session", "thread-id": "explicit-thread" },
+    body: JSON.stringify({ prompt_cache_key: "cache-session" }),
+  })
+  assert.equal(calls.at(-1).get("session-id"), "explicit-session")
+  assert.equal(calls.at(-1).get("thread-id"), "explicit-thread")
 })
 
 test("metadata and configured headers only fill names missing from the agent request", async (t) => {
@@ -327,7 +394,7 @@ test("missing malformed and unsafe metadata does not fail requests or leak arbit
   ]) {
     await loader.fetch(BASE + "/v1/responses", { method: "POST", body })
     assert.equal(calls.at(-1).body, body)
-    assert.deepEqual([...calls.at(-1).headers.keys()].sort(), ["authorization", "user-agent"])
+    assert.deepEqual([...calls.at(-1).headers.keys()].sort(), ["authorization", "openai-beta", "originator", "user-agent", "version"])
   }
 })
 
@@ -662,7 +729,7 @@ test("real HTTP sends headers, preserves streaming, cancellation and refuses red
   }
   t.after(() => { server.closeAllConnections(); server.close() })
   const base = `http://127.0.0.1:${server.address().port}`
-  const plugin = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "magpie-test", "X-Client": "real-http" } })
+  const plugin = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "upstream-client/1.0", "X-Client": "real-http" } })
   const account = auth({ baseURL: base })
   assert.equal((await plugin.auth.usage(async () => account)).balance, "$9.99")
   const loader = await plugin.auth.loader(async () => account)
@@ -675,7 +742,7 @@ test("real HTTP sends headers, preserves streaming, cancellation and refuses red
   for (const call of calls) {
     assert.equal(call.headers.authorization, `Bearer ${account.key}`)
     assert.equal(call.headers["x-client"], "real-http")
-    assert.equal(call.headers["user-agent"], "magpie-test")
+    assert.equal(call.headers["user-agent"], "upstream-client/1.0")
   }
   const automatic = await plugins.Sub2apiPlugin({}, { apiPaths: { responses: "/openai/v1" } })
   const automaticLoader = await automatic.auth.loader(async () => account)
@@ -688,14 +755,18 @@ test("real HTTP sends headers, preserves streaming, cancellation and refuses red
   assert.equal(await metadataResponse.text(), 'data: {"ok":true}\n\ndata: [DONE]\n\n')
   assert.equal(calls.at(-1).path, "/openai/v1/responses")
   assert.equal(calls.at(-1).body, body)
-  assert.equal(calls.at(-1).headers["user-agent"], "magpie/test")
+  assert.match(calls.at(-1).headers["user-agent"], CODEX_UA)
+  assert.equal(calls.at(-1).headers["originator"], "codex_cli_rs")
+  assert.equal(calls.at(-1).headers["openai-beta"], "responses=experimental")
+  assert.equal(calls.at(-1).headers.version, "0.159.0")
   assert.equal(calls.at(-1).headers["session-id"], "loopback-session")
   assert.equal(calls.at(-1).headers["x-codex-window-id"], "loopback-session:0")
   assert.equal(calls.at(-1).headers["x-codex-turn-metadata"], '{"turn_id":"loopback-turn"}')
   assert.equal(calls.at(-1).headers.authorization, `Bearer ${account.key}`)
   const claudeResponse = await automaticLoader.fetch(base + "/v1/messages", { method: "POST", body, headers: { "User-Agent": "magpie/test" } })
   await claudeResponse.text()
-  assert.equal(calls.at(-1).headers["user-agent"], "magpie/test")
+  assert.equal(calls.at(-1).headers["user-agent"], CLAUDE_UA)
+  assert.equal(calls.at(-1).headers["x-app"], "cli")
   assert.equal(calls.at(-1).headers["x-codex-window-id"], undefined)
   await assert.rejects(loader.fetch(base + "/v1/redirect"))
   assert.equal(calls.some((c) => c.path === "/v1/target"), false)
