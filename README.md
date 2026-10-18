@@ -145,7 +145,7 @@ magpie plugin login backup
 
 Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<version>` User-Agent，而不是把 Codex、Claude Code 等 Agent 的原始 UA 交给插件。插件会识别并替换 Magpie 自己的 `magpie/*`、`magpie-*` UA，避免它被发送到模型上游；若请求中带有可识别的 Codex/Claude Agent 标记，则优先选择对应 UA。若插件实际收到的是非 Magpie 的 Agent UA，则原样保留。
 
-没有可用的 Agent UA 时，插件按实际 API 协议补充以下兼容标识；这些版本用于客户端识别，不代表宿主安装的 SDK 版本：
+宿主已丢弃的原始头无法由插件恢复，`X-Magpie-Agent` 在当前 Magpie 中也不是传给 provider 插件的标准字段，因此不能保证跨协议调用时恢复真实 Agent。没有可识别的 Agent 信息时，插件按实际 API 协议补充以下兼容标识；这些版本用于客户端识别，不代表宿主安装的 SDK 版本：
 
 | API 协议 | 自动 `User-Agent` |
 | --- | --- |
@@ -156,7 +156,7 @@ Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<versi
 
 选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。若显式 `User-Agent` 配置有效且不是 Magpie 自身 UA，它会替换内部 Magpie UA，但不会覆盖真实的非 Magpie Agent UA。配置优先级为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些推理默认值。
 
-Responses 请求还会补齐 Codex 客户端头：`OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`。调用方给出的更高 `version` 会保留并使用在 UA 中。Claude 请求缺失时补充 `x-app: cli` 和 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
+先识别收到的 Agent 信息，再补充默认头，避免 Responses 默认值把 Claude 调用误判为 Codex。Codex 请求缺失时补齐 `OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`；已有 `version` 原样保留，缺失时从原始 Codex UA 提取，否则使用兼容版本。自动生成 Codex UA 时优先使用有效的 `version`，真实 UA 不改写。Claude 请求缺失时补充 `x-app: cli`；Messages 协议缺失时补充 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
 
 Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
 

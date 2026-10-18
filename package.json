@@ -1,6 +1,6 @@
 {
   "name": "sub2api-magpie-plugin",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Magpie provider for Sub2API: subscriptions, balance, models, four API protocols and custom request headers",
   "type": "module",
   "main": "./index.mjs",

@@ -37,17 +37,15 @@ const CODEX_VERSION = "0.159.0"
 const CLAUDE_CLI_VERSION = "2.1.296"
 const PROTOCOL_USER_AGENTS = {
   anthropic: `claude-cli/${CLAUDE_CLI_VERSION} (external, cli)`,
-  responses: `codex_cli_rs/${CODEX_VERSION} (${agentPlatform()}; ${agentArch()}) ${agentTerminal()}`,
   "chat-completions": "OpenAI/JS",
   gemini: "google-genai-sdk",
 }
 const PROTOCOL_IDENTITY_HEADERS = {
-  responses: {
+  codex: {
     "openai-beta": "responses=experimental",
     originator: "codex_cli_rs",
-    version: CODEX_VERSION,
   },
-  anthropic: {
+  claude: {
     "x-app": "cli",
   },
 }
@@ -93,29 +91,24 @@ function isMagpieUserAgent(value) {
   return /^magpie(?:[/-]|$)/i.test(String(value ?? "").trim())
 }
 
-function newerVersion(supplied, fallback = CODEX_VERSION) {
-  if (!/^\d+(?:\.\d+){1,3}$/.test(supplied)) return fallback
-  const a = supplied.split(".").map(Number)
-  const b = fallback.split(".").map(Number)
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const left = a[i] ?? 0
-    const right = b[i] ?? 0
-    if (left !== right) return left > right ? supplied : fallback
-  }
-  return fallback
+function codexVersion(headers) {
+  const supplied = String(headers.get("version") ?? "").trim()
+  if (/^\d+(?:\.\d+){1,3}$/.test(supplied)) return supplied
+  const native = /^(?:codex[^/\s]*|acp-extension-codex|Codex Desktop)\/(\d+(?:\.\d+){1,3})(?=\s|$)/i.exec(headers.get("user-agent") ?? "")
+  return native?.[1] ?? CODEX_VERSION
 }
 
 function codexUserAgent(headers) {
-  const version = newerVersion(String(headers.get("version") ?? "").trim())
+  const version = codexVersion(headers)
   return `codex_cli_rs/${version} (${agentPlatform()}; ${agentArch()}) ${agentTerminal()}`
 }
 
 function callingAgent(headers) {
-  const named = String(headers.get("x-magpie-agent") ?? "").trim().toLowerCase()
-  if (named === "codex" || named === "claude") return named
   const userAgent = String(headers.get("user-agent") ?? "").trim().toLowerCase()
   if (/^(codex|codex_cli_rs|codex_exec|codex_vscode|acp-extension-codex)/.test(userAgent)) return "codex"
   if (/^claude-cli\//.test(userAgent) || userAgent.includes("claude code")) return "claude"
+  const named = String(headers.get("x-magpie-agent") ?? "").trim().toLowerCase()
+  if (named === "codex" || named === "claude") return named
   const originator = String(headers.get("originator") ?? "").trim().toLowerCase()
   if (/^(codex|acp-extension-codex)/.test(originator)) return "codex"
   for (const name of headers.keys()) {
@@ -125,8 +118,7 @@ function callingAgent(headers) {
   return ""
 }
 
-function fallbackUserAgent(protocol, headers) {
-  const agent = callingAgent(headers)
+function fallbackUserAgent(protocol, headers, agent) {
   if (agent === "codex") return codexUserAgent(headers)
   if (agent === "claude") return PROTOCOL_USER_AGENTS.anthropic
   return PROTOCOL_USER_AGENTS[protocol]
@@ -565,21 +557,25 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     // Built-in identity < protocol headers < global/site/account headers.
     // Agent-provided headers still win, except Magpie's own UA, which a plugin
     // provider is given instead of the calling agent's and must not forward.
-    const configured = new Headers(PROTOCOL_IDENTITY_HEADERS[protocol])
-    new Headers(protocolExtra[protocol]).forEach((value, name) => configured.set(name, value))
+    const configured = new Headers(protocolExtra[protocol])
     new Headers(extra).forEach((value, name) => configured.set(name, value))
+    // Detect the agent before protocol defaults can masquerade as caller hints.
+    const identity = new Headers(configured)
+    headers.forEach((value, name) => identity.set(name, value))
+    const agent = callingAgent(identity) || (protocol === "responses" ? "codex" : protocol === "anthropic" ? "claude" : "")
+    if (protocol) {
+      new Headers(PROTOCOL_IDENTITY_HEADERS[agent]).forEach((value, name) => {
+        if (!configured.has(name)) configured.set(name, value)
+      })
+      if (agent === "codex" && !configured.has("version")) configured.set("version", codexVersion(identity))
+    }
     configured.forEach((value, name) => {
       if (name !== "user-agent" && !headers.has(name)) headers.set(name, value)
     })
-    if (protocol === "responses") {
-      const version = String(headers.get("version") ?? "").trim()
-      const selected = newerVersion(version)
-      if (selected !== version) headers.set("version", selected)
-    }
     const requestedUA = String(headers.get("user-agent") ?? "").trim()
     const configuredUA = String(configured.get("user-agent") ?? "").trim()
     if (protocol && (!requestedUA || isMagpieUserAgent(requestedUA))) {
-      headers.set("user-agent", configuredUA && !isMagpieUserAgent(configuredUA) ? configuredUA : fallbackUserAgent(protocol, headers))
+      headers.set("user-agent", configuredUA && !isMagpieUserAgent(configuredUA) ? configuredUA : fallbackUserAgent(protocol, headers, agent))
     } else if (!requestedUA && configuredUA && !isMagpieUserAgent(configuredUA)) {
       headers.set("user-agent", configuredUA)
     }

@@ -249,10 +249,58 @@ test("inference preserves Codex identity, native user agent and session headers"
   } })
   const headers = calls[0]
   assert.equal(headers.get("user-agent"), "codex_cli_rs/0.162.0")
+  assert.equal(headers.get("version"), "0.162.0")
   assert.equal(headers.get("originator"), "codex_cli_rs")
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
   assert.equal(headers.get("x-codex-source"), "codex-tui")
+})
+
+test("agent detection precedes protocol defaults on cross-protocol requests", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init.headers; return json({}) })
+  for (const hints of [
+    { "x-claude-code-session-id": "claude-session" },
+    { "x-magpie-agent": "claude" },
+    { "user-agent": CLAUDE_UA, "x-magpie-agent": "codex" },
+  ]) {
+    await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "magpie/test", ...hints } })
+    assert.equal(sent.get("user-agent"), CLAUDE_UA)
+    assert.equal(sent.get("x-app"), "cli")
+    for (const name of ["originator", "version", "openai-beta", "x-magpie-agent"]) assert.equal(sent.has(name), false)
+  }
+  await loader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "magpie/test", originator: "codex_exec" } })
+  assert.match(sent.get("user-agent"), CODEX_UA)
+  assert.equal(sent.get("originator"), "codex_exec")
+  assert.equal(sent.has("x-app"), false)
+  assert.equal(sent.get("anthropic-version"), "2023-06-01")
+})
+
+test("Codex versions preserve explicit headers and derive only missing values from native UAs", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init.headers; return json({}) })
+  for (const version of ["0.140.0", "0.200.0", "custom-build", ""]) {
+    await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "codex_cli_rs/0.162.0", version } })
+    assert.equal(sent.get("version"), version)
+    assert.equal(sent.get("user-agent"), "codex_cli_rs/0.162.0")
+  }
+  for (const ua of ["codex_exec/0.162.3", "Codex Desktop/0.162.3 (Mac OS; arm64)", "acp-extension-codex/0.162.3"]) {
+    await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": ua } })
+    assert.equal(sent.get("version"), "0.162.3")
+    assert.equal(sent.get("user-agent"), ua)
+  }
+  for (const version of ["0.140.0", "0.200.0"]) {
+    await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "magpie/test", version } })
+    assert.equal(sent.get("version"), version)
+    assert.ok(sent.get("user-agent").startsWith(`codex_cli_rs/${version} `))
+  }
+  await loader.fetch(BASE + "/v1/responses")
+  assert.equal(sent.get("version"), "0.159.0")
+  assert.match(sent.get("user-agent"), CODEX_UA)
 })
 
 test("Responses promotes existing Codex body metadata without changing the body or routing", async (t) => {
