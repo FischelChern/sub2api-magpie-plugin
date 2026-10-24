@@ -180,7 +180,27 @@ test("failed refreshes never use old or host models, and failed queries are not 
   assert.equal(calls.length, 3)
 })
 
-test("optional Codex lookup uses a short budget, failure cache and never queries Claude-only groups", async (t) => {
+test("default manifest budget preserves efforts and Fast when discovery takes over one second", async (t) => {
+  mockAPI(t, async ({ url, init }) => {
+    if (!url.includes("backend-api")) return Response.json(catalog("gpt-6.1-sol"))
+    await new Promise((resolve, reject) => {
+      const aborted = () => { clearTimeout(timer); reject(init.signal.reason) }
+      const timer = setTimeout(() => { init.signal.removeEventListener("abort", aborted); resolve() }, 1100)
+      init.signal.addEventListener("abort", aborted, { once: true })
+    })
+    return Response.json({ models: [{
+      slug: "gpt-6.1-sol",
+      supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      service_tiers: [{ id: "priority", name: "Fast" }],
+    }] })
+  })
+  const plugin = await Sub2apiPlugin()
+  const found = await plugin.provider.models(previous, { auth: account() })
+  assert.deepEqual(Object.keys(found["gpt-6.1-sol"].variants), ["low", "medium", "high", "xhigh", "max", "ultra"])
+  assert.deepEqual(found["gpt-6.1-sol"].serviceTiers, ["priority"])
+})
+
+test("optional Codex lookup honors a short explicit budget, failure cache and never queries Claude-only groups", async (t) => {
   const calls = mockAPI(t, ({ url, init }) => {
     if (!url.includes("backend-api")) return Response.json(catalog("gpt-test"))
     return new Promise((resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }))

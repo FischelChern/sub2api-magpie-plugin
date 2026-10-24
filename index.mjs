@@ -57,7 +57,7 @@ const ICON_MAX = 1 << 20
 const ICON_PAGE_MAX = 512 << 10
 const QUERY_DEFAULTS = {
   timeoutMs: TIMEOUT,
-  effortsTimeoutMs: 1000,
+  effortsTimeoutMs: TIMEOUT,
   modelsTtlMs: 60_000,
   usageTtlMs: 5000,
   effortsTtlMs: 300_000,

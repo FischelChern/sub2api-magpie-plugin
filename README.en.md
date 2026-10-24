@@ -117,7 +117,7 @@ Site IDs must start with a lowercase letter or digit, contain only lowercase let
 ## Models and Usage
 
 - `GET /v1/models`: models available to this key's group. Auto mode uses Messages for Claude, Responses for OpenAI model names, native Gemini for Gemini names, and Chat Completions for domestic/other compatible models. Namespaced model IDs are recognized as well.
-- `GET /backend-api/codex/models`: optional reasoning levels, queried only for catalogs containing Responses models, with a separate one-second timeout. Existing levels or model-name-based defaults are retained when unavailable.
+- `GET /backend-api/codex/models`: optional reasoning levels, queried only for catalogs containing Responses models, with a separate 15-second timeout. Existing levels or model-name-based defaults are retained when unavailable.
 - `GET /v1/usage`: subscription day/week/month windows and expiry, key quota/rate-limit windows, or wallet balance.
 - Usage-window exhaustion participates in Magpie routing. Wallet balance is displayed only, without a routing window.
 - Only the current key's group is visible, not all user subscriptions or purchasable plans.
@@ -226,7 +226,7 @@ Management queries have bounded bodies, timeouts and same-account concurrent req
   "diagnostics": false,
   "query": {
     "timeoutMs": 15000,
-    "effortsTimeoutMs": 1000,
+    "effortsTimeoutMs": 15000,
     "modelsTtlMs": 60000,
     "usageTtlMs": 5000,
     "effortsTtlMs": 300000,
@@ -237,7 +237,7 @@ Management queries have bounded bodies, timeouts and same-account concurrent req
 
 - TTLs are milliseconds, up to one hour. Set a TTL to `0` to disable completed-result caching while still coalescing in-flight queries. Reusing a successful result within its TTL is not stale fallback after failure. The query cache holds at most 128 entries, evicting earlier entries when full.
 - Query and reasoning timeouts accept 1-60000 milliseconds. JSON size accepts 1 byte to 64 MiB, default 4 MiB, checking both declared and actually read sizes.
-- Only catalogs containing Responses models query the Codex manifest, with a separate one-second budget by default. Failed probes are cached for 30 seconds; known reasoning levels survive. Account icon discovery no longer delays model discovery.
+- Only catalogs containing Responses models query the Codex manifest, with a separate 15-second budget by default so slower sites do not lose reported reasoning levels and Fast capabilities. Failed probes are cached for 30 seconds; known reasoning levels survive. Account icon discovery no longer delays model discovery.
 - HTTP 401 invalidates queries for that credential scope and marks sign-in expired, without affecting other keys. Other required-query failures are not success-cached. Neither management queries nor billable inference requests automatically retry.
 - `diagnostics: true` emits fixed event names, protocols, timings, counts, cache hits and HTTP status codes. Logs contain no account/model names, site URLs, bodies or header values. Management errors do not echo upstream bodies, which might reflect credentials.
 
