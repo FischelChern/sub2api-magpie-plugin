@@ -10,7 +10,7 @@
 
 - **套餐和用量**：读取 `GET /v1/usage`，显示套餐名、到期时间、日/周/月额度，或 key 总额度及限速窗口。
 - **余额**：余额计费的 key 显示钱包余额，包括零余额。
-- **模型列表**：读取 `GET /v1/models`，可选读取 `GET /backend-api/codex/models` 获取思考等级；后者不可用时保留已知等级或使用默认值。
+- **模型列表**：自动读取 `GET /v1/models` 的思考等级和快速档位；含 Responses 模型时自动通过同一 key 的 `GET /backend-api/codex/models` 补充缺失信息，无需开启额外选项。辅助接口不可用时保留已知思考等级或使用默认值，不猜测快速权限。
 - **账号绑定**：完整列出每个 API key 返回的模型，支持分页；发送使用所选账号自己的 Base URL、API key 和请求头，不在插件内切换 key 或模型。
 - **原模型速度选择**：读取当前 key 报告的 Fast / Ultraspeed 能力，以 `serviceTiers` 交给 Magpie，让支持该能力的 Agent 在原模型上选择速度，不额外生成模型。
 - **请求指标**：保留四种协议的用量、缓存和流式事件，由 Magpie 原生统计耗时、首响应、token、缓存命中率、输出速度和估算费用，不重复上报账单。
@@ -268,6 +268,12 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 数值仅为配置示例，须按站点实际能力和计价填写。覆盖项只应用于 key 本来就能查询到的模型，不会凭空添加权限。全局 < 站点 < 账号元数据；筛选数组逐层替换，名称逐 ID 合并，覆盖元数据深度合并。可覆盖 `name`、`limit`、`cost`、`capabilities`、`options`、`headers`、`variants`、`release_date`、`status` 和 `serviceTiers`，但不能改模型身份、API 地址或账号凭据。`serviceTiers` 数组逐层替换。额外模型请求头仍接受保留头校验。显式协议继续使用 `modelProtocols`。
 
 ### 在原模型上选择 Fast / Ultraspeed
+
+能力读取不限定模型家族：Claude、Gemini、DeepSeek、Qwen 和自定义别名均读取主列表报告的思考等级。主列表只报告 `reasoning: true` 或 `capabilities.reasoning: true` 而未提供等级时，使用默认思考等级；没有能力声明的未知模型不强行标记为思考模型。快速服务档位同样逐模型读取，但只有使用 OpenAI 兼容协议时才声明 `serviceTiers`，不把 Anthropic/Gemini 原生速度参数混用为 OpenAI 服务档位。
+
+思考等级优先采用主列表的 `supported_reasoning_levels`（字符串或 `{ "effort": "high" }` 数组），其次采用辅助 Codex manifest，然后保留宿主已有等级；都没有时，GPT-5 及后续数字代际、o 系列和其他已识别思考模型默认使用 `low` / `medium` / `high`。`modelOverrides` 仍可显式覆盖。默认等级只是兼容回退，不代表站点已验证支持；不会自动添加 `xhigh`。
+
+若 Codex 没有显示思考等级或 `/fast`，请先更新 Magpie、重载插件并重新同步客户端模型目录，再重启 Codex。使用 `model_catalog_json` 时应检查该 JSON 中对应模型的 `supported_reasoning_levels` 和 `service_tiers`；只刷新网关模型列表未必会更新客户端正在读取的文件。快速档位来源均缺失时保持不展示；确认上游权限后可按下文显式配置，不会发送收费探测请求。
 
 模型列表只保留站点返回的真实 ID。插件把当前 key 报告的服务档位写入原模型的 `serviceTiers`，由 Magpie 提供给支持速度选择的 Agent（例如支持服务档位目录的 Codex）。不生成 `-fast` / `-ultraspeed` 模型，不更改原模型的 ID、思考等级或默认速度。显示名末尾的 `(fast)` / `（fast）`、`(ultraspeed)`、`(ultrafast)` 等速度标签会移除（包括站点、宿主缓存和自定义名称）；真实 ID 本身不清理，速度能力仅通过参数元数据声明，不根据标签推断支持。
 

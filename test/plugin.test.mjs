@@ -29,6 +29,96 @@ function mockAPI(t, usage = { balance: 12.34 }) {
   return calls
 }
 
+test("GPT generations use fallback efforts despite stale non-reasoning host metadata", async (t) => {
+  const ids = ["gpt-6-astra", "gpt-6.1-sol", "vendor/gpt-6-luna", "gpt-10-sol", "gpt-4.1", "other-test"]
+  t.mock.method(globalThis, "fetch", async (input) => new URL(input).pathname.endsWith("/models") && !String(input).includes("backend-api")
+    ? json({ data: ids.map((id) => ({ id })) }) : json({}, 404))
+  const plugin = await plugins.Sub2apiPlugin()
+  const previous = Object.fromEntries(ids.map((id) => [id, { capabilities: { reasoning: false }, variants: {} }]))
+  const models = await plugin.provider.models({ models: previous }, { auth: auth() })
+  for (const id of ids) {
+    const thinks = !["gpt-4.1", "other-test"].includes(id)
+    assert.equal(models[id].capabilities.reasoning, thinks, id)
+    assert.deepEqual(Object.keys(models[id].variants), thinks ? ["low", "medium", "high"] : [], id)
+    assert.deepEqual(models[id].serviceTiers, [], id)
+  }
+})
+
+test("primary reasoning levels win over manifest and stay isolated by account", async (t) => {
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (String(input).includes("backend-api")) return json({ models: [{ slug: "gpt-6-sol", supported_reasoning_levels: ["medium"] }] })
+    const first = new Headers(init?.headers).get("authorization") === "Bearer key-a"
+    return json({ data: [{ id: "gpt-6-sol", supported_reasoning_levels: first
+      ? [" low ", { effort: "xhigh" }, "low", null, 7, {}] : ["high"] }] })
+  })
+  const plugin = await plugins.Sub2apiPlugin()
+  const a = await plugin.provider.models({ models: {} }, { auth: auth({}, "key-a") })
+  const b = await plugin.provider.models({ models: {} }, { auth: auth({}, "key-b") })
+  assert.deepEqual(Object.keys(a["gpt-6-sol"].variants), ["low", "xhigh"])
+  assert.deepEqual(Object.keys(b["gpt-6-sol"].variants), ["high"])
+})
+
+test("primary reasoning levels work without manifest and explicit overrides still win", async (t) => {
+  t.mock.method(globalThis, "fetch", async (input) => String(input).includes("backend-api") ? json({}, 404)
+    : json({ data: [{ id: "custom-model", supported_reasoning_levels: [{ effort: "high" }] }] }))
+  const plugin = await plugins.Sub2apiPlugin()
+  const models = await plugin.provider.models({ models: {} }, { auth: auth() })
+  assert.equal(models["custom-model"].capabilities.reasoning, true)
+  assert.deepEqual(Object.keys(models["custom-model"].variants), ["high"])
+  const configured = await plugins.Sub2apiPlugin({}, { modelOverrides: {
+    "custom-model": { capabilities: { reasoning: false }, variants: { low: {} } },
+  } })
+  const overridden = await configured.provider.models({ models: {} }, { auth: auth() })
+  assert.equal(overridden["custom-model"].capabilities.reasoning, false)
+  assert.deepEqual(Object.keys(overridden["custom-model"].variants), ["low"])
+})
+
+test("model discovery automatically supplements efforts and speed from the same key manifest", async (t) => {
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (init?.credentials === "omit") return new Response(null, { status: 404 })
+    calls.push(new Headers(init?.headers).get("authorization"))
+    if (String(input).includes("backend-api")) return json({ models: [
+      { slug: "gpt-6-sol", supported_reasoning_levels: ["low", "high", "xhigh"], service_tiers: [{ id: "priority" }, "ultrafast"] },
+      { slug: "gpt-6-luna", service_tiers: ["priority"] },
+    ] })
+    return json({ data: [{ id: "gpt-6-sol" }, { id: "gpt-6-luna", service_tiers: [] }] })
+  })
+  const plugin = await plugins.Sub2apiPlugin()
+  const models = await plugin.provider.models({ models: {} }, { auth: auth({}, "key-a") })
+  assert.deepEqual(Object.keys(models["gpt-6-sol"].variants), ["low", "high", "xhigh"])
+  assert.deepEqual(models["gpt-6-sol"].serviceTiers, ["priority", "ultrafast"])
+  assert.deepEqual(models["gpt-6-luna"].serviceTiers, [])
+  assert.deepEqual(calls, ["Bearer key-a", "Bearer key-a"])
+})
+
+test("all model families and aliases read reported efforts and protocol-appropriate speed tiers", async (t) => {
+  const entries = [
+    { id: "claude-custom", supported_reasoning_levels: ["low", "max"], service_tiers: ["priority"] },
+    { id: "gemini-custom", supported_reasoning_levels: ["minimal", "high"], service_tiers: ["priority"] },
+    { id: "deepseek-custom", supported_reasoning_levels: ["high"], service_tiers: ["priority"] },
+    { id: "qwen-custom", supported_reasoning_levels: [{ effort: "medium" }], service_tiers: ["ultrafast"] },
+    { id: "private-alias", reasoning: true, service_tiers: ["priority", "ultrafast"] },
+    { id: "another-alias", capabilities: { reasoning: true } },
+    { id: "opaque-model" },
+  ]
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (init?.credentials === "omit") return new Response(null, { status: 404 })
+    return json({ data: entries })
+  })
+  const plugin = await plugins.Sub2apiPlugin()
+  const models = await plugin.provider.models({ models: {} }, { auth: auth() })
+  const expected = [["low", "max"], ["minimal", "high"], ["high"], ["medium"], ["low", "medium", "high"], ["low", "medium", "high"], []]
+  for (const [i, entry] of entries.entries()) {
+    assert.deepEqual(Object.keys(models[entry.id].variants), expected[i], entry.id)
+    assert.equal(models[entry.id].capabilities.reasoning, expected[i].length > 0, entry.id)
+    assert.deepEqual(models[entry.id].serviceTiers, i < 2 ? [] : entry.service_tiers ?? [], entry.id)
+  }
+  const compatible = await plugins.Sub2apiPlugin({}, { modelProtocols: { "claude-custom": "chat-completions", "gemini-custom": "chat-completions" } })
+  const openaiModels = await compatible.provider.models({ models: {} }, { auth: auth() })
+  for (const id of ["claude-custom", "gemini-custom"]) assert.deepEqual(openaiModels[id].serviceTiers, ["priority"])
+})
+
 test("only provider plugin functions are exported", () => {
   assert.equal(Object.keys(plugins).length, 9)
   for (const value of Object.values(plugins)) assert.equal(typeof value, "function")

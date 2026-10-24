@@ -834,6 +834,16 @@ const LEVELS = ["low", "medium", "high"]
 
 const variantsOf = (levels) => Object.fromEntries(levels.map((l) => [l, {}]))
 
+function reasoningLevels(model) {
+  if (!Array.isArray(model?.supported_reasoning_levels)) return undefined
+  const levels = []
+  for (const level of model.supported_reasoning_levels) {
+    const effort = typeof level === "string" ? level : level?.effort
+    if (typeof effort === "string" && effort.trim() && !levels.includes(effort.trim())) levels.push(effort.trim())
+  }
+  return levels.some((level) => level !== "none") ? levels : undefined
+}
+
 function modelDisplayName(name, id) {
   if (typeof name !== "string" || name === id) return id
   // Speed belongs in serviceTiers, not trailing display labels. Keep real IDs intact.
@@ -843,12 +853,12 @@ function modelDisplayName(name, id) {
 
 // runtimeModel is magpie's model. Its variants are its reasoning levels
 // (magpie offers a thinking model's variants' keys as its efforts), the
-// first of: the levels the site tells (told), the variants magpie already
+// first of: the primary/manifest levels the site tells (told), the variants magpie already
 // has for the model (was: models.dev's, the config's), LEVELS when the
 // model thinks.
 function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   const kept = was?.variants && typeof was.variants === "object" && Object.keys(was.variants).length ? was.variants : undefined
-  const reasoning = !!told?.length || !!kept || /think|reason|(?:^|\/)(?:o\d|gpt-5|codex-)/i.test(m.id)
+  const reasoning = m.reasoning === true || !!told?.length || !!kept || /think|reason|(?:^|\/)(?:o\d|gpt-(?:[5-9]|[1-9]\d+)(?:[.-]|$)|codex-)/i.test(m.id)
   const defaults = {
     id: m.id,
     providerID,
@@ -880,7 +890,7 @@ function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   out.name = override.name ?? (m.named ? m.name : was?.name ?? m.name)
   if (told?.length && override.variants === undefined) out.variants = variantsOf(told)
   if (override.variants !== undefined) out.variants = mergeModel(override.variants)
-  if (override.capabilities?.reasoning === undefined && told?.length) out.capabilities.reasoning = true
+  if (override.capabilities?.reasoning === undefined && reasoning) out.capabilities.reasoning = true
   return out
 }
 
@@ -896,13 +906,8 @@ async function codexModels(query, base, key, extra, settings, report) {
   const out = Object.create(null)
   for (const m of Array.isArray(body?.models) ? body.models : []) {
     if (typeof m?.slug !== "string" || !m.slug) continue
-    const levels = []
-    for (const l of Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels : []) {
-      const e = typeof l === "string" ? l : l?.effort
-      if (typeof e === "string" && e.trim() && !levels.includes(e.trim())) levels.push(e.trim())
-    }
     out[m.slug] = {
-      levels: levels.some((l) => l !== "none") ? levels : undefined,
+      levels: reasoningLevels(m),
       serviceTiers: reportedTiers(m),
     }
   }
@@ -949,7 +954,7 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
     const named = typeof display === "string" && !!display
     const name = named ? display : m.id
     const protocol = modelProtocol(m.id, routing)
-    out[m.id] = runtimeModel({ id: m.id, name, named }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
+    out[m.id] = runtimeModel({ id: m.id, name, named, reasoning: m.reasoning === true || m.capabilities?.reasoning === true }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, reasoningLevels(m) ?? told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
     out[m.id].name = modelDisplayName(selection.modelNames[m.id] ?? out[m.id].name, m.id)
     out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
   }

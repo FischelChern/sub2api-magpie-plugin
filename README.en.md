@@ -8,6 +8,12 @@ Project source: `sub2api magpie`. This project is refactored from that provider 
 
 ## Local Installation
 
+Capability discovery is not restricted to model families: Claude, Gemini, DeepSeek, Qwen and custom aliases all read primary-list reasoning levels. A primary entry with `reasoning: true` or `capabilities.reasoning: true` but no levels receives default efforts. Unknown models without capability evidence are not forced into reasoning mode. Speed tiers are also read per model, but `serviceTiers` are advertised only for OpenAI-compatible protocols; native Anthropic/Gemini speed parameters are not treated as OpenAI service tiers.
+
+Model discovery automatically reads reasoning levels and speed tiers from `GET /v1/models`. Catalogs containing Responses models also query `GET /backend-api/codex/models` with the same key to supplement missing metadata; no extra switch is needed. Primary `supported_reasoning_levels` (strings or objects such as `{ "effort": "high" }`) take precedence over the manifest, then existing host levels. Without those, GPT-5 and later numeric generations, o-series and other recognized reasoning models fall back to `low` / `medium` / `high`. These defaults are not verified upstream capabilities and do not automatically include `xhigh`. Explicit `modelOverrides` still take precedence. Missing speed eligibility is never guessed or tested with billable requests.
+
+If Codex shows neither reasoning levels nor `/fast`, update Magpie, reload the plugin, resynchronize the client model catalog and restart Codex. When using `model_catalog_json`, inspect that file's `supported_reasoning_levels` and `service_tiers` for the selected model: refreshing the gateway alone may not refresh the file the client reads. If the site reports no speed metadata, configure `modelOverrides.<id>.serviceTiers` only after confirming upstream eligibility, as described below.
+
 From this project directory:
 
 ```sh
