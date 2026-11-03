@@ -158,11 +158,13 @@ Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<versi
 
 先识别收到的 Agent 信息，再补充默认头，避免 Responses 默认值把 Claude 调用误判为 Codex。Codex 请求缺失时补齐 `OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`；已有 `version` 原样保留，缺失时从原始 Codex UA 提取，否则使用兼容版本。自动生成 Codex UA 时优先使用有效的 `version`，真实 UA 不改写。Claude 请求缺失时补充 `x-app: cli`；Messages 协议缺失时补充 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
 
-Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
+Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
+
+当调用方本身不是官方 Codex——没有 Codex UA、`originator` 或 `x-codex-*` 请求头——而走 Responses 协议时，插件会伪装出官方客户端始终携带的会话标识：缺失的 `session-id` / `thread-id`、`x-codex-window-id` 和 `x-codex-installation-id`。这些标识是确定性 UUID，按账号与会话（调用方自带的 `x-session-id` / `x-opencode-session`，否则按请求的模型）保持稳定，不会每个请求轮换，因此网关的会话亲和与用量关联看到的是一个连贯的 Codex 客户端。显式配置的 `protocolHeaders` / `headers` / 账号头优先于伪装值，请求体始终不改写。官方 Codex 调用方的身份与对话 ID 原样透传，不做任何补齐。
 
 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最多读取 1 MiB；副本读取最多等待 15 秒，并响应取消信号。直接通过 `init.body` 传入的 `ReadableStream`、编码后的请求体及过大的请求体不做转换，原样交给 fetch；已提供的 HTTP 头仍保留。无效 JSON 或头值会忽略，新增元数据请求头合计最多 8 KiB。这些头可能包含客户端、会话和本地工作区信息，只应发送给可信供应商；若无需转发某项，请在调用方移除对应元数据。
 
-这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。如果仍返回 `This account only allows Codex official clients`，站点可能还校验请求体或其他客户端特征；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
+这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。开启 `codex_cli_only`（仅允许官方 Codex 客户端）的站点会校验 Codex 引擎指纹——`x-codex-*` 请求头加上官方身份标识——上述伪装即为兼容调用方提供这一指纹。如果仍返回 `This account only allows Codex official clients`，站点可能还勾选了请求体级别的指纹信号（`client_metadata.x-codex-*`）或配置了更严格的黑白名单；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
 
 ### 校验和安全边界
 
