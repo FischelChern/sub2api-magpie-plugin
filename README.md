@@ -143,9 +143,9 @@ magpie plugin login backup
 
 ### 自动 User-Agent 与客户端标识
 
-Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<version>` User-Agent，而不是把 Codex、Claude Code 等 Agent 的原始 UA 交给插件。插件会识别并替换 Magpie 自己的 `magpie/*`、`magpie-*` UA，避免它被发送到模型上游；若请求中带有可识别的 Codex/Claude Agent 标记，则优先选择对应 UA。若插件实际收到的是非 Magpie 的 Agent UA，则原样保留。
+插件按实际 API 协议家族判断原始调用方：Responses 检查官方 Codex UA 家族及可解析的引擎版本，Messages 检查 `claude-cli/x.y.z`。对应官方调用方的原始 UA 和身份、会话头直接保留；第三方调用方（包括 Magpie、omp、pi、OpenCode 或跨协议的另一家 Agent）使用目标协议的官方兼容 UA，不再原样保留第三方 UA。Chat Completions 和 Gemini 仍沿用现有 Agent 提示与 UA 补齐规则。
 
-宿主已丢弃的原始头无法由插件恢复，`X-Magpie-Agent` 在当前 Magpie 中也不是传给 provider 插件的标准字段，因此不能保证跨协议调用时恢复真实 Agent。没有可识别的 Agent 信息时，插件按实际 API 协议补充以下兼容标识；这些版本用于客户端识别，不代表宿主安装的 SDK 版本：
+判定发生在正文元数据提升及配置头合并之前。`X-Magpie-Agent`、配置中的官方 UA/身份头以及正文 `client_metadata` 不是调用方本身为官方的证据；宿主已丢弃的原始头也无法恢复。以下版本仅用于兼容标识，不代表宿主安装的 SDK 版本：
 
 | API 协议 | 自动 `User-Agent` |
 | --- | --- |
@@ -154,17 +154,23 @@ Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<versi
 | `chat-completions` | `OpenAI/JS` |
 | `gemini` | `google-genai-sdk` |
 
-选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。若显式 `User-Agent` 配置有效且不是 Magpie 自身 UA，它会替换内部 Magpie UA，但不会覆盖真实的非 Magpie Agent UA。配置优先级为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些推理默认值。
+选择依据是实际请求的 API 类型，不是再次解析模型名；`modelProtocols` 和自定义 `apiPaths` 同样适用。配置优先级为 **内置协议默认值 < `protocolHeaders` < 全局 `headers` < 站点 `headers` < 账号 `headers`**。显式配置可覆盖第三方伪装默认值，但不会覆盖官方调用方已有的原始头；若显式配置本身不是官方兼容 UA，仍可能被上游官方客户端限制拒绝。用量、模型列表、Codex 思考等级查询及无法识别协议的接口不添加这些推理默认值。
 
-先识别收到的 Agent 信息，再补充默认头，避免 Responses 默认值把 Claude 调用误判为 Codex。Codex 请求缺失时补齐 `OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`；已有 `version` 原样保留，缺失时从原始 Codex UA 提取，否则使用兼容版本。自动生成 Codex UA 时优先使用有效的 `version`，真实 UA 不改写。Claude 请求缺失时补充 `x-app: cli`；Messages 协议缺失时补充 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
+第三方 Responses 请求缺失时补齐 `OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`；已有 `version` 原样保留，自动 UA 使用有效版本或兼容版本。官方 Codex 的 UA、版本及会话身份不被伪装值覆盖，也不为其生成缺失的会话身份。Claude 请求缺失时补充 `x-app: cli`；Messages 缺失时补充 `anthropic-version: 2023-06-01`。已有调用方身份头优先，`init.headers` 中的同名值覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
 
 Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
 
-当调用方本身不是官方 Codex——没有 Codex UA、`originator` 或 `x-codex-*` 请求头——而走 Responses 协议时，插件会伪装出官方客户端始终携带的会话标识：缺失的 `session-id` / `thread-id`、`x-codex-window-id` 和 `x-codex-installation-id`。这些标识是确定性 UUID，按账号与会话（调用方自带的 `x-session-id` / `x-opencode-session`，否则按请求的模型）保持稳定，不会每个请求轮换，因此网关的会话亲和与用量关联看到的是一个连贯的 Codex 客户端。显式配置的 `protocolHeaders` / `headers` / 账号头优先于伪装值，请求体始终不改写。官方 Codex 调用方的身份与对话 ID 原样透传，不做任何补齐。
+第三方 Responses 请求会补齐缺失的 `session-id` / `thread-id`、`x-codex-window-id` 和 `x-codex-installation-id`。这些标识是确定性 UUID，按账号与会话（调用方自带的 `x-session-id` / `x-opencode-session`，否则按模型）保持稳定，不会每个请求轮换。显式配置头优先于伪装默认值，已有调用方身份值优先于配置；Codex 身份兼容不改写业务正文。官方 Codex 使用其自己的身份与对话 ID。
 
-元数据检查支持字符串、字节、Blob 和 `Request` 副本，最多读取 1 MiB；副本读取最多等待 15 秒，并响应取消信号。直接通过 `init.body` 传入的 `ReadableStream`、编码后的请求体及过大的请求体不做转换，原样交给 fetch；已提供的 HTTP 头仍保留。无效 JSON 或头值会忽略，新增元数据请求头合计最多 8 KiB。这些头可能包含客户端、会话和本地工作区信息，只应发送给可信供应商；若无需转发某项，请在调用方移除对应元数据。
+第三方 Claude Messages 还执行严格正文兼容：补充独立的 `You are Claude Code, Anthropic's official CLI for Claude.` 身份文本块，保留原有 system 内容、messages、tools、模型和速度参数；原 system 字符串转为文本块，已有块不丢弃。保留符合上游格式的 `metadata.user_id`，否则生成按账号/会话隔离的稳定设备与会话标识，保留其余 metadata 字段。缺失的 `anthropic-beta` 使用 `claude-code-20250219`，已有 beta 保留。官方 Claude 正文不做此兼容重写，`count_tokens`、其他协议和管理查询正文也不改。
 
-这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。开启 `codex_cli_only`（仅允许官方 Codex 客户端）的站点会校验 Codex 引擎指纹——`x-codex-*` 请求头加上官方身份标识——上述伪装即为兼容调用方提供这一指纹。如果仍返回 `This account only allows Codex official clients`，站点可能还勾选了请求体级别的指纹信号（`client_metadata.x-codex-*`）或配置了更严格的黑白名单；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
+此操作会改变第三方 Claude 请求的提示词前缀、输入 token 和缓存键；只应对你有权配置的可信上游使用。不伪造计费归因块，不更改账号权限，不通过重试或修改 `max_tokens` 绕过校验。无法安全解析或有界重写的请求会明确报错，不会悄悄原样发送并声称满足严格门。
+
+第三方 Claude 正文重写支持字符串、字节、Blob 和未消费的 `Request`，使用插件自己的 32 MiB 上限；`Request` 副本最多读取 15 秒，超时不发送已读到的 JSON 前缀。压缩正文和直接作为 `init.body` 传入的流无法安全完成时会明确报错；请先提供未压缩、可读取的 JSON。官方 Claude 原始请求不受这项正文重写限制。
+
+Codex 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最多读取 1 MiB；副本读取最多等待 15 秒，并响应取消信号。直接通过 `init.body` 传入的 `ReadableStream`、编码后的请求体及过大的请求体不做 Codex 元数据提升，原样交给 fetch；已提供的 HTTP 头仍保留。无效 JSON 或头值会忽略，新增元数据请求头合计最多 8 KiB。Claude 严格正文兼容使用单独的有界 JSON 读取规则，不适用这种静默跳过。元数据可能包含客户端、会话和本地工作区信息，只应发送给可信供应商。
+
+这些标识是可伪造的兼容性启发式，不证明调用方真的是官方客户端。默认 `codex_cli_only` 使用官方候选 UA、可解析版本和 `x-codex-*` 引擎指纹；Claude `claude_code_only` 的常规 Messages 还检查 system 身份块、非空兼容头及 `metadata.user_id`。上述实现以 [Sub2API 客户端校验源码](https://github.com/Wei-Shaw/sub2api/blob/251094436325175c9e0ab06e7b962d05369fd766/backend/internal/service/claude_code_validator.go)为依据；管理员自定义的 Codex 正文指纹、版本范围或其他黑白名单仍须另行满足，不承诺绕过任意私有策略。
 
 ### 校验和安全边界
 
@@ -242,7 +248,7 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 - key A 和 key B 的模型独立交给 Magpie。只有 A 列出的模型由 A 的发送函数调用；只有 B 列出的模型由 B 调用。两者都有的同名模型由 Magpie 的账号路由选择，选定后使用该账号自己的 URL、key 和请求头，不把模型静态绑定到最后登录的 key，也不把 key 放进模型对象。
 - 多 key 可以属于不同站点，也可以属于同一站点的不同分组。查询缓存按地址、key 和合并后的请求头隔离，仅进程内保存摘要索引，不持久化密钥。
 - 模型刷新保留 Magpie 已知的上下文、输出限制、价格、能力、选项和模型请求头；重新确定当前账号的 API 地址、模型 ID 和 SDK。未知价格不再填成零，未知视觉或推理能力不直接按协议判定。
-- 模型查询失败直接抛出错误，不返回宿主默认列表、其他账号列表或过期列表。已记录的失败也阻止该账号已有发送函数继续使用宿主可能保留的旧列表，直到模型查询恢复。请求体中可安全读取的模型 ID 还会校验是否属于该账号的已发现列表；不为此消费流式上传。
+- 模型查询失败直接抛出错误，不返回宿主默认列表、其他账号列表或过期列表作为成功刷新。普通目录错误会短暂阻断该账号已有发送函数：成功刷新可立即恢复，否则错误在 30 秒后解除；到期只清除错误，保留最近成功目录的模型 ID 和档位（若存在），继续进行模型核对和旧速度 ID 归一化，不重新查询或返回旧目录。首次查询尚未成功时没有这些目录元数据。401 登录失效不会随这 30 秒自动解除，必须由失效后新启动的成功模型刷新恢复；较早的在途刷新不能覆盖较新的目录或清除较新的登录失效状态。不为模型核对消费流式上传。
 - 实际模型请求只发送一次，除下述旧速度 ID 的发送前兼容转换外保持请求模型不变，原样返回上游状态、响应流或网络错误；插件不做重试、不换模型、不换 key。Magpie 自身的路由组或 provider fallback 是宿主配置，本插件不修改它们；需要端到端禁止模型回退时，请清空宿主的备用模型并直接选择 `sub2api/<模型>` 或独立站点模型。需要固定某个 key 时，可由客户端向 Magpie 发送 `X-Magpie-Account: <账号名或 ID>`，不要把它配置成发给站点的额外请求头。
 
 ### 可选筛选、名称和能力覆盖
@@ -294,7 +300,7 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参数保持 `priority`。`ultraspeed` 是配置别名，线上参数使用 `ultrafast`，不是 `service_tier: "ultraspeed"`。
 
 - **仅报告有依据的能力**：优先读取当前 key 的 `/v1/models` 中的 `service_tiers` / `serviceTiers`，支持字符串或 `{ "id": "priority" }` 数组。含 Responses 模型时，缺失字段可由同一 key 的 `/backend-api/codex/models` 补充。主列表明确返回空数组、`null` 或无效值时，不从辅助 manifest 补回权限。
-- 没有速度元数据时，不按 GPT 名称、套餐名、协议或其他 key 的模型信息推断支持，也不发起收费探测。可选 manifest 失败不隐藏原模型，但不会把上次的速度能力当成当前结果。能力展示是否准确仍取决于站点报告，不能替代上游权限校验。
+- 没有速度元数据时，不按 GPT 名称、套餐名、协议或其他 key 的模型信息推断支持，也不发起收费探测。可选 manifest 的非 401 失败不隐藏原模型，但不会把上次的速度能力当成一次成功刷新的当前结果；401 仍作为登录失效处理。能力展示是否准确仍取决于站点报告，不能替代上游权限校验。
 - 站点未报告、但你已确认某个 key 支持时，可以为原模型显式声明。以下配置也可放在站点选项或账号 `metadata` 中；同名模型在不同 key 上权限不同时，优先账号级配置：
 
 ```json
@@ -306,7 +312,7 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 ```
 
 - `serviceTiers` 只声明能力，不自动启用速度；空数组明确关闭展示，支持 `fast` → `priority`、`ultraspeed` → `ultrafast` 配置别名。全局 < 站点 < 账号，数组逐层替换。声明不会添加 key 未列出的模型或授予真实权限。
-- 此选择机制用于 Responses / Chat Completions 的 `service_tier`。Anthropic 原生 `speed: "fast"` 请求保留原始请求体，并在缺少时向最终 `anthropic-beta` 追加 `fast-mode-2026-02-01`，保留已有 beta、不重复追加；`speed: "standard"` 或未选择 fast 时不添加。只处理 `/messages` 推理，不作用于 token 统计、管理接口或其他协议，不把 Anthropic/Gemini 模型伪装成支持 OpenAI 服务档位；对这些协议显式配置非空 `serviceTiers` 会报错。站点以 OpenAI 兼容协议提供同一模型时，可按实际情况设置 `modelProtocols`。
+- 此选择机制用于 Responses / Chat Completions 的 `service_tier`。Anthropic 的原生 `speed: "fast"` 参数保持不变，并在缺少时向最终 `anthropic-beta` 追加 `fast-mode-2026-02-01`，保留已有 beta、不重复追加；`speed: "standard"` 或未选择 fast 时不添加。官方 Claude 保留原始正文，第三方 Claude 仅执行上文说明的身份正文补全，不改变速度。只处理 `/messages` 推理，不作用于 token 统计、管理接口或其他协议，不把 Anthropic/Gemini 模型伪装成支持 OpenAI 服务档位；对这些协议显式配置非空 `serviceTiers` 会报错。站点以 OpenAI 兼容协议提供同一模型时，可按实际情况设置 `modelProtocols`。
 - 每次请求仍使用所选账号自己的 Base URL、key 和协议路径。标准请求不改写 Agent 选择的模型或速度，不注入默认速度、不预读响应流；不支持时直接返回原始上游错误，不降档、不重试、不换 key 或模型。
 - 需要支持插件 `serviceTiers` 的 Magpie 版本，以及能读取目录和发送对应参数的 Agent。不是所有客户端都会自动出现速度菜单；不支持菜单的客户端可自行设置标准请求参数。宿主在请求到达插件之前可能有自己的参数转换、账号重试或回退；端到端禁止回退须单独关闭这些宿主策略，插件不修改宿主配置。
 - 升级后请重载插件和模型列表，并将原来的合成速度模型选择、筛选、价格覆盖或路由引用改回原模型。为兼容已保存的旧选择，当请求 ID 不在当前 key 目录、去掉末尾 `-fast` / `-ultraspeed` / `-ultrafast` 后的原 ID 在目录中，且该 key 明确声明对应档位时，插件在首次发送前转换为原 ID 加 `service_tier`（Fast 为 `priority`，另两者为 `ultrafast`）。例如 `gpt-6.1-sol-fast` 转为 `gpt-6.1-sol` 加 `service_tier: "priority"`，不增加目录模型，也不在失败后重试。真实存在的完整 ID 优先，绝不去后缀；不猜测空格、连字符或其他别名。能力未知、参数冲突或非 OpenAI 兼容协议直接报错。兼容转换仅处理大小受限的可读 JSON，流式上传不改写；旧合成模型的私有请求头标记仍明确报错，需刷新模型列表。
@@ -328,7 +334,7 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 
 - **Magpie 跨协议边界**：本次仅修改 provider 插件。同协议请求可携带客户端原生速度；跨协议到 OpenAI 兼容上游时，还需要 Magpie 保留所选档位且模型 `serviceTiers` 已声明。当前 Magpie 对自定义地址的 Anthropic 跨协议转发可能丢弃 fast；插件无法恢复到达前已丢弃的字段。客户端不发送参数或宿主丢弃参数时，不会偷偷替用户开启 fast。使用同协议路径或升级具有相应能力的宿主。
 - **Anthropic beta 与权限**：部分模型仍要求 `fast-mode-2026-02-01`，部分新模型已不要求。补兼容头不等于支持该模型或获得加速权限；以站点权限及响应 `usage.speed` 为准。客户端显式发送 `speed: "standard"` 时不会被改成 fast，也不会把 `service_tier: "priority"` 擅自转换成 Anthropic `speed`。
-- **大请求与流式上传**：自动补 beta 的 JSON 检查沿用 1 MiB / 15 秒及取消限制，不消费原始 `Request`；编码后的请求体、超限请求体及 `init.body` 流式上传不检查。此类请求需要客户端自己携带 beta，或在 `protocolHeaders.claude` 中显式配置 `anthropic-beta`。插件不会缓冲响应，fast 的用量、限流头及错误原样返回。
+- **大请求与流式上传**：官方 Claude 的 fast 检查沿用 1 MiB / 15 秒及取消限制，不消费原始 `Request`；无法检查的正文原样转发，所需 beta 应由调用方提供或通过 `protocolHeaders.claude` 配置。第三方 Claude 则先按上文 32 MiB / 15 秒规则完成严格身份正文，同一次读取也用于检查 fast；不能安全完成的压缩正文或直接流输入明确报错。插件不会缓冲响应，fast 的用量、限流头及错误原样返回。
 - **Claude Code 客户端检查**：网关可正常推理不代表 `/fast` 一定可用。Claude Code 可能直接向 Anthropic 检查 fast 权限，或因网关 token 格式而不发检查；遇到这种情况先按[官方网关说明](https://code.claude.com/docs/en/fast-mode#use-fast-mode-behind-proxies-and-llm-gateways)排查。插件无法执行或替代客户端登录/权限检查。Claude Code、omp 或 Magpie 自身也可能降档重试，插件不增加这种行为。
 
 参数依据：[Anthropic fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode)、[Claude Code fast mode](https://code.claude.com/docs/en/fast-mode)、[OpenAI fast mode](https://developers.openai.com/api/docs/guides/fast-mode)、[Magpie provider 插件接口](https://usemagpie.ai/docs/plugins#provider)。
@@ -354,8 +360,8 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 
 - TTL 为毫秒，设为 `0` 禁用完成结果缓存，但仍合并正在进行的相同查询；TTL 最大 1 小时。缓存是有效期内的成功结果复用，不是失败后的旧数据回退。缓存最多 128 项，超出逐出较早条目。
 - 普通查询超时和思考等级查询超时分别可设为 1–60000 毫秒；JSON 大小可设为 1 字节到 64 MiB，默认 4 MiB，并检查声明长度和实际读取长度。
-- 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒，避免较慢站点的能力查询被误降级为三个默认等级且不显示 Fast；失败后 30 秒内不重复探测，保留已知思考等级。图标发现和模型发现互不阻塞。
-- 401 会清除该凭据作用域的查询缓存并标记需要登录，不影响其他 key；其他失败不作为成功缓存。没有管理查询或计费请求的自动重试。
+- 只有含 Responses 模型的列表才查询 Codex manifest，默认最多额外等 15 秒，避免较慢站点的能力查询被误降级为三个默认等级且不显示 Fast；非 401 失败后 30 秒内不重复探测，保留已知思考等级。图标发现和模型发现互不阻塞。
+- 当前模型刷新或用量查询观察到的 401 会标记需要登录，不影响其他 key；独立用量查询后到的 401 仍生效，不会被先完成的模型刷新忽略。每次普通目录错误阻断推理 30 秒，缓存命中不会延长该期限；被较新模型刷新替代的旧结果不能重建过时错误。401 会清除该凭据作用域的查询缓存，其他失败不作为成功缓存，没有管理查询或计费请求的自动重试。
 - 开启 `diagnostics: true` 可查看固定事件名、协议、耗时、数量、缓存命中和 HTTP 状态。日志不包含账号名、模型名、站点 URL、请求体、响应体或请求头值。管理接口错误不回显站点返回的内容，避免反射密钥。
 
 ## 请求指标
@@ -403,6 +409,8 @@ npm pack --dry-run
 ```
 
 测试无需 API key、npm 依赖或 Docker。覆盖套餐、余额、分页全量模型、模型元数据保留、请求头覆盖顺序、账号隔离、四种协议、显式别名、协议路径重写、Gemini 认证、请求体/取消信号保留、URL 安全、失败不回退、查询缓存/体积/超时限制，以及图标发现和凭据隔离。速度测试验证无额外模型、当前 key 的服务档位发现、元数据优先级、未知能力不推断、原模型速度参数透传、并发隔离及旧选择迁移。指标测试验证四种协议的 JSON/SSE 用量、缓存与 reasoning 字段不丢失、流不被预读、未知价格不造零。真实 loopback HTTP 测试覆盖多 key 对应地址和凭据、原模型速度选择、SSE、取消、图标获取与重定向拒绝；环境禁止监听本地端口时会明确跳过相关项。CI 在 Linux/macOS 和 Node.js 20/22/24 上运行相同检查、测试和打包预览。
+
+恢复回归还覆盖普通错误 TTL 后的旧速度 ID 迁移、迟到刷新/401 的完成顺序、缓存淘汰后的鉴权失效；身份测试覆盖官方请求透传、第三方 Claude 严格正文补全、Codex 头兼容、会话稳定性、账号隔离，以及超时不转发 JSON 前缀。
 
 本地测试不等于真实 Magpie/Sub2API 联调。连接自己的站点后，请在 Magpie 中验证用量和模型列表，再发起一次模型请求；附加头是否抵达可通过自有网关访问日志确认（请勿记录认证值）。
 

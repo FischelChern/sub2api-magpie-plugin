@@ -249,7 +249,7 @@ test("Agent-selected speeds preserve the exact original request, key, response a
     for (const tier of [undefined, "priority", "ultrafast"]) {
       const model = path === "messages" ? "claude-test" : path === "responses" ? "gpt-test" : "chat-model"
       const body = JSON.stringify({ model, stream: true, ...(path === "messages" ? { speed: "fast" } : tier ? { service_tier: tier } : {}) })
-      assert.equal(await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, signal: controller.signal, headers: { authorization: "Bearer wrong" } }), response)
+      assert.equal(await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, signal: controller.signal, headers: { authorization: "Bearer wrong", ...(path === "messages" ? { "user-agent": "claude-cli/2.1.296 (external, cli)" } : {}) } }), response)
       assert.equal(requests.at(-1).init.body, body)
       assert.equal(requests.at(-1).headers.get("authorization"), "Bearer speed-test-key")
       assert.equal(requests.at(-1).init.signal, controller.signal)
@@ -299,7 +299,7 @@ test("fast compatibility never enables speed from an Agent name or another proto
     ["chat/completions", '{"speed":"fast","service_tier":"ultrafast"}'],
     ["models", '{"speed":"fast"}'],
   ]) {
-    await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, headers: { "user-agent": "claude-cli/test" } })
+    await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, headers: { "user-agent": "claude-cli/2.1.296 (external, cli)" } })
     const sent = path === "models" ? queries.at(-1) : requests.at(-1)
     assert.equal(sent.headers.has("anthropic-beta"), false, path + " " + body)
     assert.equal(sent.init.body, body)
@@ -311,13 +311,13 @@ test("uninspectable native uploads stay untouched and can carry an explicit fast
   const plugin = await Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => account())
   const body = '{"speed":"fast"}'
-  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "content-encoding": "gzip" } })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "user-agent": "claude-cli/2.1.296 (external, cli)", "content-encoding": "gzip" } })
   assert.equal(requests.at(-1).headers.has("anthropic-beta"), false)
   const large = JSON.stringify({ speed: "fast", padding: "x".repeat(1 << 20) })
-  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: large })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: large, headers: { "user-agent": "claude-cli/2.1.296 (external, cli)" } })
   assert.equal(requests.at(-1).headers.has("anthropic-beta"), false)
   const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); controller.close() } })
-  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half", headers: { "anthropic-beta": FAST_BETA } })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half", headers: { "user-agent": "claude-cli/2.1.296 (external, cli)", "anthropic-beta": FAST_BETA } })
   assert.equal(stream.locked, false)
   assert.equal(requests.at(-1).init.body, stream)
   assert.equal(requests.at(-1).headers.get("anthropic-beta"), FAST_BETA)
@@ -329,7 +329,7 @@ test("native fast rejection stays visible without downgrading speed or retrying 
   const plugin = await Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => account("fast-account"))
   const body = '{"model":"claude-alias","speed":"fast","messages":[]}'
-  const result = await loader.fetch(BASE + "/v1/messages", { method: "POST", body })
+  const result = await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "user-agent": "claude-cli/2.1.296 (external, cli)" } })
   assert.equal(result, rejection)
   assert.equal(result.headers.get("retry-after"), "60")
   assert.equal(await result.text(), "fast capacity exhausted")
@@ -485,6 +485,45 @@ test("migration never retries network errors or borrows stale tiers after refres
   await plugin.provider.models(provider, { auth: account() })
   await assert.rejects(loader.fetch(BASE + "/v1/responses", { body }), /has not declared/)
   assert.equal(requests.length, 1)
+})
+
+test("catalog error expiry retains legacy speed migration and the account model boundary", async (t) => {
+  let now = 1000
+  let failed = false
+  let modelCalls = 0
+  const requests = []
+  t.mock.method(Date, "now", () => now)
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    const url = String(input)
+    if (init?.credentials === "omit") return new Response(null, { status: 404 })
+    if (url.endsWith("/v1/models")) {
+      modelCalls++
+      return failed ? new Response(null, { status: 503 })
+        : Response.json({ data: [{ id: "gpt-test", service_tiers: ["priority", "ultrafast"] }] })
+    }
+    if (url.includes("/backend-api/")) return Response.json({ models: [] })
+    requests.push(init)
+    return Response.json({ ok: true })
+  })
+  const plugin = await Sub2apiPlugin({}, { query: { modelsTtlMs: 0 } })
+  await plugin.provider.models(provider, { auth: account() })
+  const loader = await plugin.auth.loader(async () => account())
+  failed = true
+  await assert.rejects(plugin.provider.models(provider, { auth: account() }), /503/)
+  now += 29_999
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"gpt-test-fast"}' }), /503/)
+  assert.equal(requests.length, 0)
+  now++
+  for (const [suffix, tier] of [["fast", "priority"], ["ultraspeed", "ultrafast"], ["ultrafast", "ultrafast"]]) {
+    const controller = new AbortController()
+    const payload = { model: "gpt-test-" + suffix, input: "hi", stream: true }
+    assert.equal((await loader.fetch(BASE + "/v1/responses", { method: "POST", body: JSON.stringify(payload), signal: controller.signal })).status, 200)
+    assert.deepEqual(JSON.parse(requests.at(-1).body), { ...payload, model: "gpt-test", service_tier: tier })
+    assert.equal(requests.at(-1).signal, controller.signal)
+  }
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"other-account-model"}' }), /not listed/)
+  assert.equal(requests.length, 3)
+  assert.equal(modelCalls, 2)
 })
 
 test("manifest failures do not reuse stale speed support or hide available models", async (t) => {

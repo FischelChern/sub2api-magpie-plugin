@@ -9,6 +9,11 @@ const BASE = "https://api.example.com"
 const CODEX_UA = /^codex_cli_rs\/0\.159\.0 \([^;]+; [^)]+\) \S+$/
 const CODEX_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CLAUDE_UA = "claude-cli/2.1.296 (external, cli)"
+const CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+const CLAUDE_IDENTITY_BLOCK = { type: "text", text: CLAUDE_IDENTITY }
+// metadata.user_id as the plugin generates it: the JSON form
+// ParseMetadataUserID reads (device_id and session_id non-empty).
+const CLAUDE_USER_ID = /^\{"device_id":"[0-9a-f]{64}","account_uuid":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}","session_id":"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"\}$/
 const auth = (metadata = {}, key = "sk-test-only-1234") => ({
   type: "api", key, metadata: { baseURL: BASE, ...metadata },
 })
@@ -203,7 +208,7 @@ test("inference passes through agent headers and enforces only the selected key"
   const response = new Response("data: test\n\n", { headers: { "content-type": "text/event-stream" } })
   const calls = []
   t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return response })
-  for (const path of ["messages", "responses", "chat/completions"]) {
+  for (const [path, expectedUA] of [["messages", "configured"], ["responses", "configured"], ["chat/completions", "agent"]]) {
     const controller = new AbortController()
     const body = '{"stream":true}'
     const actual = await loader.fetch(`${BASE}/v1/${path}`, {
@@ -214,10 +219,14 @@ test("inference passes through agent headers and enforces only the selected key"
     const { init } = calls.at(-1)
     assert.equal(init.headers.get("authorization"), `Bearer ${account.key}`)
     assert.equal(init.headers.get("x-api-key"), account.key)
-    assert.equal(init.headers.get("user-agent"), "agent")
+    if (expectedUA instanceof RegExp) assert.match(init.headers.get("user-agent"), expectedUA)
+    else assert.equal(init.headers.get("user-agent"), expectedUA)
+    if (path === "messages") assert.equal(init.headers.get("x-app"), "cli")
+    if (path === "responses") assert.equal(init.headers.get("originator"), "codex_cli_rs")
     assert.equal(init.headers.get("x-client"), "agent")
     assert.equal(init.headers.get("x-trace"), "trace")
-    assert.equal(init.body, body)
+    if (path === "messages") assert.equal(JSON.parse(init.body).system[0].text, CLAUDE_IDENTITY)
+    else assert.equal(init.body, body)
     assert.equal(init.signal, controller.signal)
     assert.equal(init.redirect, "error")
   }
@@ -280,7 +289,12 @@ test("inference preserves real agent user agents and replaces Magpie's own", asy
       else assert.equal(calls.at(-1).get("user-agent"), expected)
     }
     await loader.fetch(new Request(url, { headers: { "User-Agent": "codex-tui/0.162.1" } }))
-    assert.equal(calls.at(-1).get("user-agent"), "codex-tui/0.162.1")
+    if (path === "messages") assert.equal(calls.at(-1).get("user-agent"), CLAUDE_UA)
+    else assert.equal(calls.at(-1).get("user-agent"), "codex-tui/0.162.1")
+    await loader.fetch(new Request(url, { headers: { "User-Agent": "opencode/0.4.0" } }))
+    if (path === "responses") assert.match(calls.at(-1).get("user-agent"), CODEX_UA)
+    else if (path === "messages") assert.equal(calls.at(-1).get("user-agent"), CLAUDE_UA)
+    else assert.equal(calls.at(-1).get("user-agent"), "opencode/0.4.0")
     await loader.fetch(new Request(url, { headers: { "User-Agent": "magpie/0.1.1271" } }))
     if (expected instanceof RegExp) assert.match(calls.at(-1).get("user-agent"), expected)
     else assert.equal(calls.at(-1).get("user-agent"), expected)
@@ -345,28 +359,432 @@ test("inference preserves Codex identity, native user agent and session headers"
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
   assert.equal(headers.get("x-codex-source"), "codex-tui")
+  // An explicit configured UA must not replace the official caller's own UA.
+  const configured = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "configured-client/1.0" } })
+  const configuredLoader = await configured.auth.loader(async () => auth())
+  await configuredLoader.fetch(new Request(BASE + "/v1/responses", { headers: { "User-Agent": "codex_cli_rs/0.162.0" } }))
+  assert.equal(calls.at(-1).get("user-agent"), "codex_cli_rs/0.162.0")
 })
 
-test("agent detection precedes protocol defaults on cross-protocol requests", async (t) => {
+test("cross-protocol callers are masqueraded as the protocol family they call", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => auth())
   let sent
   t.mock.method(globalThis, "fetch", async (_, init) => { sent = init.headers; return json({}) })
-  for (const hints of [
-    { "x-claude-code-session-id": "claude-session" },
-    { "x-magpie-agent": "claude" },
+  // Hints and even a Claude UA prove nothing about the Responses protocol: the
+  // caller is not an official Codex client, so it gets Codex identity.
+  for (const headers of [
+    { "user-agent": "magpie/test", "x-claude-code-session-id": "claude-session" },
+    { "user-agent": "magpie/test", "x-magpie-agent": "claude" },
     { "user-agent": CLAUDE_UA, "x-magpie-agent": "codex" },
   ]) {
-    await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "magpie/test", ...hints } })
-    assert.equal(sent.get("user-agent"), CLAUDE_UA)
-    assert.equal(sent.get("x-app"), "cli")
-    for (const name of ["originator", "version", "openai-beta", "x-magpie-agent"]) assert.equal(sent.has(name), false)
+    await loader.fetch(BASE + "/v1/responses", { headers })
+    assert.match(sent.get("user-agent"), CODEX_UA)
+    assert.equal(sent.get("originator"), "codex_cli_rs")
+    assert.equal(sent.get("version"), "0.159.0")
+    assert.equal(sent.get("openai-beta"), "responses=experimental")
+    assert.equal(sent.has("x-app"), false)
+    assert.equal(sent.has("x-magpie-agent"), false)
   }
-  await loader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "magpie/test", originator: "codex_exec" } })
-  assert.match(sent.get("user-agent"), CODEX_UA)
+  // A Codex UA on Messages is third-party for Claude Code: the official UA and
+  // compatibility headers are filled, while the caller's own headers pass.
+  await loader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "codex_exec/0.162.3", originator: "codex_exec" } })
+  assert.equal(sent.get("user-agent"), CLAUDE_UA)
+  assert.equal(sent.get("x-app"), "cli")
   assert.equal(sent.get("originator"), "codex_exec")
-  assert.equal(sent.has("x-app"), false)
   assert.equal(sent.get("anthropic-version"), "2023-06-01")
+})
+
+test("official Claude callers keep their own UA and identity headers", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, {
+    headers: { "User-Agent": "configured-client/1.0", "x-app": "configured-app", "x-client": "configured" },
+  })
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  await loader.fetch(new Request(BASE + "/v1/messages", {
+    method: "POST",
+    body: '{"model":"claude-test"}',
+    headers: {
+      "User-Agent": "claude-cli/2.1.300 (external, cli)",
+      "x-app": "claude-code",
+      "x-claude-code-session-id": "cc-session",
+      "anthropic-beta": "caller-beta",
+    },
+  }))
+  const sent = calls[0]
+  assert.equal(sent.get("user-agent"), "claude-cli/2.1.300 (external, cli)")
+  assert.equal(sent.get("x-app"), "claude-code")
+  assert.equal(sent.get("x-claude-code-session-id"), "cc-session")
+  assert.equal(sent.get("anthropic-beta"), "caller-beta")
+  assert.equal(sent.get("anthropic-version"), "2023-06-01")
+  assert.equal(sent.get("x-client"), "configured")
+})
+
+test("third-party Messages callers speak as Claude Code, and only inference bodies are completed", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  const controller = new AbortController()
+  const body = JSON.stringify({ model: "claude-test", stream: true, messages: [] })
+  for (const path of ["messages", "messages/count_tokens"]) {
+    const response = await loader.fetch(BASE + "/v1/" + path, {
+      method: "POST", body, signal: controller.signal,
+      headers: { "user-agent": "opencode/0.4.0" },
+    })
+    const call = calls.at(-1)
+    assert.equal(response.status, 200)
+    assert.equal(call.headers.get("user-agent"), CLAUDE_UA)
+    assert.equal(call.headers.get("x-app"), "cli")
+    assert.equal(call.headers.get("anthropic-version"), "2023-06-01")
+    assert.equal(call.headers.get("authorization"), `Bearer ${auth().key}`)
+    // count_tokens is answered from the user agent alone: it keeps the body the
+    // caller sent, while the inference path gets the gate's identity block and
+    // a parseable metadata.user_id.
+    if (path === "messages") {
+      const sent = JSON.parse(call.body)
+      assert.deepEqual(sent.system, [CLAUDE_IDENTITY_BLOCK])
+      assert.match(sent.metadata.user_id, CLAUDE_USER_ID)
+      assert.deepEqual(sent.messages, [])
+      assert.equal(sent.stream, true)
+      assert.equal(sent.model, "claude-test")
+      assert.equal(call.headers.get("anthropic-beta"), "claude-code-20250219")
+    } else {
+      assert.equal(call.body, body)
+      assert.equal(call.headers.has("anthropic-beta"), false)
+    }
+    assert.equal(call.signal, controller.signal)
+  }
+  // An explicit configured UA overrides that stand-in, but never an official UA.
+  const configured = await plugins.Sub2apiPlugin({}, { headers: { "User-Agent": "configured-claude/1.0" } })
+  const configuredLoader = await configured.auth.loader(async () => auth())
+  await configuredLoader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "opencode/0.4.0" } })
+  assert.equal(calls.at(-1).headers.get("user-agent"), "configured-claude/1.0")
+  await configuredLoader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "claude-cli/2.1.301 (external, cli)" } })
+  assert.equal(calls.at(-1).headers.get("user-agent"), "claude-cli/2.1.301 (external, cli)")
+})
+
+test("Claude masquerade stays isolated per account and never forwards caller credentials", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const first = await plugin.auth.loader(async () => auth({}, "sk-first"))
+  const second = await plugin.auth.loader(async () => auth({}, "sk-second"))
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  await first.fetch(BASE + "/v1/messages", { headers: { "user-agent": "opencode/0.4.0", authorization: "Bearer wrong" } })
+  await second.fetch(BASE + "/v1/messages", { headers: { "user-agent": "opencode/0.4.0", authorization: "Bearer wrong" } })
+  assert.deepEqual(calls.map((headers) => headers.get("user-agent")), [CLAUDE_UA, CLAUDE_UA])
+  assert.deepEqual(calls.map((headers) => headers.get("authorization")), ["Bearer sk-first", "Bearer sk-second"])
+  assert.deepEqual(calls.map((headers) => headers.get("x-api-key")), ["sk-first", "sk-second"])
+})
+
+test("Messages bodies gain the Claude Code identity, a stand-in user id and the claude-code beta", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init; return json({}) })
+  const payload = {
+    model: "claude-test",
+    max_tokens: 4096,
+    speed: "standard",
+    stream: true,
+    system: "You are a careful assistant.",
+    tools: [{ name: "read", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+  }
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify(payload), headers: { "content-length": "2" } })
+  const body = JSON.parse(sent.body)
+  // The gate reads the prose from a text block, so the exact identity is added
+  // first and the caller's own system string is kept as its own text block.
+  assert.deepEqual(body.system, [CLAUDE_IDENTITY_BLOCK, { type: "text", text: payload.system }])
+  assert.match(body.metadata.user_id, CLAUDE_USER_ID)
+  assert.equal(sent.headers.get("anthropic-beta"), "claude-code-20250219")
+  assert.equal(sent.headers.get("x-app"), "cli")
+  assert.equal(sent.headers.get("anthropic-version"), "2023-06-01")
+  // Nothing else is added, dropped, reordered or rewritten: no billing block,
+  // no model, max_tokens, speed, tool or message change.
+  assert.deepEqual(Object.keys(body).sort(), ["max_tokens", "messages", "metadata", "model", "speed", "stream", "system", "tools"])
+  for (const field of ["model", "max_tokens", "speed", "stream", "tools", "messages"]) assert.deepEqual(body[field], payload[field])
+  assert.equal(sent.body.includes("x-anthropic-billing-header"), false)
+  // A rewritten body invalidates whatever length the caller declared.
+  assert.equal(sent.headers.has("content-length"), false)
+})
+
+test("Messages system arrays keep every original block and never duplicate the identity", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init; return json({}) })
+  const own = [
+    { type: "text", text: "first block", cache_control: { type: "ephemeral" } },
+    { type: "text", text: "second block" },
+  ]
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", system: own }) })
+  assert.deepEqual(JSON.parse(sent.body).system, [CLAUDE_IDENTITY_BLOCK, ...own])
+  // An existing identity block is recognized however its whitespace is written.
+  for (const given of [
+    [CLAUDE_IDENTITY_BLOCK, { type: "text", text: "second block" }],
+    [{ type: "text", text: "  You are Claude Code,   Anthropic's official CLI for Claude. " }],
+  ]) {
+    await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", system: given }) })
+    const body = JSON.parse(sent.body)
+    assert.deepEqual(body.system, given)
+    assert.match(body.metadata.user_id, CLAUDE_USER_ID)
+  }
+  for (const system of [CLAUDE_IDENTITY, "  " + CLAUDE_IDENTITY + "  "]) {
+    await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", system }) })
+    assert.deepEqual(JSON.parse(sent.body).system, [{ type: "text", text: system }])
+  }
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", system: "" }) })
+  assert.deepEqual(JSON.parse(sent.body).system, [CLAUDE_IDENTITY_BLOCK])
+  // A body that already satisfies the gate is forwarded byte for byte.
+  const compliant = JSON.stringify({
+    model: "claude-test",
+    system: [CLAUDE_IDENTITY_BLOCK, { type: "text", text: "extra" }],
+    metadata: { user_id: "user_" + "a".repeat(64) + "_account__session_123e4567-e89b-12d3-a456-426614174000" },
+  })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: compliant })
+  assert.equal(sent.body, compliant)
+  assert.equal(sent.headers.get("anthropic-beta"), "claude-code-20250219")
+})
+
+test("Messages metadata keeps a parseable user id and every other field", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init; return json({}) })
+  const parseable = [
+    // Legacy form, including an empty account and upper-case hex.
+    "user_" + "a1B2".repeat(16) + "_account_550e8400-e29b-41d4-a716-446655440000_session_123e4567-e89b-12d3-a456-426614174000",
+    // JSON form, which ParseMetadataUserID reads case-insensitively.
+    '{"device_id":"d61f76d0","session_id":"c72554f2-1234-5678-abcd-123456789abc"}',
+    '{"DEVICE_ID":"upper","SESSION_ID":"also"}',
+    '{"device_id":"device","session_id":"session","account_uuid":null}',
+    '{"device_id":"device","DEVICE_ID":null,"session_id":"session"}',
+  ]
+  for (const userID of parseable) {
+    await loader.fetch(BASE + "/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-test", system: [CLAUDE_IDENTITY_BLOCK], metadata: { user_id: userID, note: "kept" } }),
+    })
+    const body = JSON.parse(sent.body)
+    assert.equal(body.metadata.user_id, userID)
+    assert.equal(body.metadata.note, "kept")
+  }
+  // A value the gate cannot parse is replaced, never forwarded, and the other
+  // metadata fields survive; metadata of an unusable shape is replaced instead.
+  await loader.fetch(BASE + "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({ model: "claude-test", metadata: { user_id: "sk-caller-secret", note: "kept" } }),
+  })
+  const replaced = JSON.parse(sent.body).metadata
+  assert.match(replaced.user_id, CLAUDE_USER_ID)
+  assert.equal(replaced.note, "kept")
+  assert.equal(sent.body.includes("sk-caller-secret"), false)
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", metadata: "not-an-object" }) })
+  assert.match(JSON.parse(sent.body).metadata.user_id, CLAUDE_USER_ID)
+  const invalid = '{"device_id":42,"DEVICE_ID":"later","session_id":"session"}'
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: JSON.stringify({ model: "claude-test", metadata: { user_id: invalid } }) })
+  assert.match(JSON.parse(sent.body).metadata.user_id, CLAUDE_USER_ID)
+})
+
+test("Messages beta tokens are kept as sent and only a missing header is completed", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let sent
+  t.mock.method(globalThis, "fetch", async (_, init) => { sent = init; return json({}) })
+  const body = JSON.stringify({ model: "claude-test", messages: [] })
+  // A caller's own betas go upstream untouched; the plugin adds none of its own.
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "anthropic-beta": "prompt-caching-2024-07-31, interleaved-thinking-2025-05-14" } })
+  assert.equal(sent.headers.get("anthropic-beta"), "prompt-caching-2024-07-31, interleaved-thinking-2025-05-14")
+  // A missing or empty header gets the token the official client sends.
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body })
+  assert.equal(sent.headers.get("anthropic-beta"), "claude-code-20250219")
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "anthropic-beta": "" } })
+  assert.equal(sent.headers.get("anthropic-beta"), "claude-code-20250219")
+  // A configured beta counts as the caller's own.
+  const configured = await plugins.Sub2apiPlugin({}, { protocolHeaders: { claude: { "anthropic-beta": "configured-beta" } } })
+  const configuredLoader = await configured.auth.loader(async () => auth())
+  await configuredLoader.fetch(BASE + "/v1/messages", { method: "POST", body })
+  assert.equal(sent.headers.get("anthropic-beta"), "configured-beta")
+})
+
+test("Messages completion accepts strings, bytes and blobs and never consumes a Request", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return json({}) })
+  const body = JSON.stringify({ model: "claude-test", messages: [] })
+  const bytes = new TextEncoder().encode(body)
+  for (const [source, value] of [
+    ["string", body],
+    ["buffer", Buffer.from(body)],
+    ["array-buffer", bytes.buffer],
+    ["view", new DataView(bytes.buffer)],
+    ["blob", new Blob([body])],
+  ]) {
+    await loader.fetch(BASE + "/v1/messages", { method: "POST", body: value, headers: { "content-length": "2" } })
+    assert.deepEqual(JSON.parse(calls.at(-1).init.body).system, [CLAUDE_IDENTITY_BLOCK], source)
+    assert.equal(calls.at(-1).init.headers.has("content-length"), false, source)
+  }
+  // A Request is inspected through a bounded clone, so the caller still holds
+  // an unread body afterwards.
+  const request = new Request(BASE + "/v1/messages", { method: "POST", body })
+  await loader.fetch(request)
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body).system, [CLAUDE_IDENTITY_BLOCK])
+  assert.equal(request.bodyUsed, false)
+  assert.equal(await request.text(), body)
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); controller.close() } })
+  const streamed = new Request(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half" })
+  await loader.fetch(streamed)
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body).system, [CLAUDE_IDENTITY_BLOCK])
+  assert.equal(await streamed.text(), body)
+})
+
+test("Messages completion keeps the streamed response, the signal and the account endpoint", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, { apiPaths: { anthropic: "/proxy/v1" } })
+  const loader = await plugin.auth.loader(async () => auth())
+  const controller = new AbortController()
+  const response = new Response('data: {"type":"message_start"}\n\n', { headers: { "content-type": "text/event-stream" } })
+  let call
+  t.mock.method(globalThis, "fetch", async (input, init) => { call = { input, init }; return response })
+  const actual = await loader.fetch(BASE + "/v1/messages", { method: "POST", body: '{"model":"claude-test"}', signal: controller.signal })
+  assert.equal(actual, response)
+  assert.equal(call.init.signal, controller.signal)
+  assert.equal(actual.bodyUsed, false)
+  assert.equal(await actual.text(), 'data: {"type":"message_start"}\n\n')
+  assert.equal(call.input instanceof Request ? call.input.url : String(call.input), BASE + "/proxy/v1/messages")
+  assert.equal(call.init.headers.get("authorization"), `Bearer ${auth().key}`)
+  assert.deepEqual(JSON.parse(call.init.body).system, [CLAUDE_IDENTITY_BLOCK])
+})
+
+test("Claude stand-in ids stay stable per account and conversation and never contain the key", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const first = await plugin.auth.loader(async () => auth({}, "sk-first"))
+  const second = await plugin.auth.loader(async () => auth({}, "sk-second"))
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  const body = JSON.stringify({ model: "claude-test", messages: [] })
+  for (const [loader, session] of [
+    [first, "conversation-a"], [first, "conversation-a"], [first, "conversation-b"], [first, undefined], [second, "conversation-a"],
+  ]) {
+    await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: session ? { "x-claude-code-session-id": session } : {} })
+  }
+  const ids = calls.map((init) => JSON.parse(init.body).metadata.user_id)
+  assert.equal(ids[0], ids[1])          // one conversation keeps one id
+  assert.notEqual(ids[0], ids[2])       // another conversation gets another
+  assert.notEqual(ids[0], ids[3])       // no signal is its own stable scope
+  assert.notEqual(ids[0], ids[4])       // another account gets another
+  assert.notEqual(JSON.parse(ids[0]).device_id, JSON.parse(ids[4]).device_id)
+  assert.deepEqual(calls.map((init) => init.headers.get("authorization")), Array(4).fill("Bearer sk-first").concat("Bearer sk-second"))
+  assert.equal(calls.some((init) => init.body.includes("sk-first") || init.body.includes("sk-second")), false)
+})
+
+test("official Claude callers keep their own body and beta byte for byte", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input, init) => { calls.push({ input, init }); return json({}) })
+  const body = JSON.stringify({ model: "claude-test", system: "A caller's own system.", max_tokens: 64, messages: [] })
+  await loader.fetch(new Request(BASE + "/v1/messages", {
+    method: "POST",
+    body,
+    headers: { "User-Agent": "claude-cli/2.1.300 (external, cli)", "anthropic-beta": "caller-beta" },
+  }))
+  assert.equal(calls[0].init.body, undefined)
+  assert.equal(calls[0].input.bodyUsed, false)
+  assert.equal(await calls[0].input.clone().text(), body)
+  assert.equal(calls[0].init.headers.get("anthropic-beta"), "caller-beta")
+  // An official caller without a beta of its own is not given one either: only
+  // the calling request decides, and its own request is forwarded as sent.
+  await loader.fetch(new Request(BASE + "/v1/messages", {
+    method: "POST",
+    body,
+    headers: { "User-Agent": "claude-cli/2.1.300 (external, cli)" },
+  }))
+  assert.equal(calls[1].init.body, undefined)
+  assert.equal(calls[1].input.bodyUsed, false)
+  assert.equal(await calls[1].input.clone().text(), body)
+  assert.equal(calls[1].init.headers.has("anthropic-beta"), false)
+  assert.equal(calls[1].init.headers.get("user-agent"), "claude-cli/2.1.300 (external, cli)")
+})
+
+test("Claude completion applies only to third-party Messages inference bodies", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  const body = JSON.stringify({ model: "claude-test", system: "kept as sent", messages: [] })
+  for (const path of ["messages/count_tokens", "chat/completions", "responses", "models/gemini-test:generateContent", "models", "usage"]) {
+    await loader.fetch(BASE + "/v1/" + path, { method: "POST", body })
+    assert.equal(calls.at(-1).body, body, path)
+    assert.equal(calls.at(-1).headers.has("anthropic-beta"), false, path)
+  }
+  // A bodyless Messages request (message list, probe) is forwarded untouched.
+  await loader.fetch(BASE + "/v1/messages", { headers: { "user-agent": "opencode/0.4.0" } })
+  assert.equal(calls.at(-1).body, undefined)
+})
+
+test("Messages bodies that cannot be completed fail explicitly", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init); return json({}) })
+  const body = JSON.stringify({ model: "claude-test", messages: [] })
+  // An encoded or streamed upload cannot be inspected, and pretending it was
+  // completed would only move the rejection upstream.
+  await assert.rejects(loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "content-encoding": "gzip" } }), /must be uncompressed/)
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); controller.close() } })
+  await assert.rejects(loader.fetch(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half" }), /streaming request body cannot be completed/)
+  for (const invalid of ["{broken", "", "[]", "null", '"text"']) {
+    await assert.rejects(loader.fetch(BASE + "/v1/messages", { method: "POST", body: invalid }), /must be a JSON object/)
+  }
+  // The plugin's own 32 MiB rewrite ceiling, not the 1 MiB window used for
+  // header metadata: a big prompt is completed, only an outsized one is refused.
+  await assert.rejects(loader.fetch(BASE + "/v1/messages", { method: "POST", body: new ArrayBuffer(33 << 20) }), /at most 32 MiB/)
+  const large = JSON.stringify({ model: "claude-test", messages: [{ role: "user", content: "x".repeat(2 << 20) }] })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: large })
+  assert.deepEqual(JSON.parse(calls.at(-1).body).system, [CLAUDE_IDENTITY_BLOCK])
+  // An aborted upload never reaches the site, so it is not reported here as a
+  // body this plugin refused to complete; fetch raises the abort instead.
+  const aborted = new AbortController()
+  aborted.abort()
+  const pending = new Request(BASE + "/v1/messages", { method: "POST", body, signal: aborted.signal })
+  await loader.fetch(pending, { signal: aborted.signal })
+  assert.equal(calls.at(-1).body, undefined)
+  assert.equal(await pending.text(), body)
+})
+
+test("body and configured Codex marks cannot make a third-party caller native", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin({}, {
+    protocolHeaders: { codex: { originator: "codex_cli_rs", "x-codex-window-id": "configured-window" } },
+  })
+  const loader = await plugin.auth.loader(async () => auth())
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
+  const body = JSON.stringify({ model: "gpt-test", client_metadata: {
+    session_id: "body-session", "x-codex-installation-id": "body-installation",
+  } })
+  await loader.fetch(BASE + "/v1/responses", {
+    method: "POST", body,
+    headers: { "user-agent": "opencode/0.4.0", "x-magpie-agent": "codex", "x-codex-source": "opencode" },
+  })
+  const sent = calls[0]
+  assert.match(sent.get("user-agent"), CODEX_UA)
+  assert.equal(sent.get("originator"), "codex_cli_rs")
+  assert.equal(sent.get("version"), "0.159.0")
+  assert.equal(sent.get("session-id"), "body-session")
+  assert.equal(sent.get("thread-id"), "body-session")
+  assert.equal(sent.get("x-codex-window-id"), "configured-window")
+  assert.equal(sent.get("x-codex-installation-id"), "body-installation")
+  assert.equal(sent.get("x-codex-source"), "opencode")
+  assert.equal(sent.has("x-magpie-agent"), false)
+  assert.equal(sent.get("authorization"), `Bearer ${auth().key}`)
+  // An official originator alone does not preserve an obviously third-party UA.
+  await loader.fetch(BASE + "/v1/responses", { headers: {
+    "user-agent": "opencode/0.4.0", originator: "codex_cli_rs",
+  } })
+  assert.match(calls.at(-1).get("user-agent"), CODEX_UA)
 })
 
 test("Codex versions preserve explicit headers and derive only missing values from native UAs", async (t) => {
@@ -379,11 +797,16 @@ test("Codex versions preserve explicit headers and derive only missing values fr
     assert.equal(sent.get("version"), version)
     assert.equal(sent.get("user-agent"), "codex_cli_rs/0.162.0")
   }
-  for (const ua of ["codex_exec/0.162.3", "Codex Desktop/0.162.3 (Mac OS; arm64)", "acp-extension-codex/0.162.3"]) {
+  for (const ua of ["codex_exec/0.162.3", "Codex Desktop/0.162.3 (Mac OS; arm64)"]) {
     await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": ua } })
     assert.equal(sent.get("version"), "0.162.3")
     assert.equal(sent.get("user-agent"), ua)
   }
+  // acp-extension-codex is not an official family the gate accepts, so its UA is
+  // replaced while its version still seeds the Codex stand-in.
+  await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "acp-extension-codex/0.162.3" } })
+  assert.equal(sent.get("version"), "0.162.3")
+  assert.match(sent.get("user-agent"), /^codex_cli_rs\/0\.162\.3 \(/)
   for (const version of ["0.140.0", "0.200.0"]) {
     await loader.fetch(BASE + "/v1/responses", { headers: { "user-agent": "magpie/test", version } })
     assert.equal(sent.get("version"), version)
@@ -568,7 +991,7 @@ test("metadata and configured headers only fill names missing from the agent req
   assert.equal(headers.get("user-agent"), "account")
   assert.equal(headers.get("session-id"), "init-session")
   assert.equal(headers.get("thread_id"), "request-thread")
-  assert.equal(headers.has("thread-id"), false)
+  assert.equal(headers.get("thread-id"), "init-session")
   assert.equal(headers.get("x-codex-turn-metadata"), "request-turn")
   assert.equal(headers.get("x-codex-window-id"), "body-window")
   assert.equal(headers.get("x-codex-installation-id"), "body-installation")
@@ -584,7 +1007,9 @@ test("Codex body metadata is not promoted on other protocols or management endpo
     await loader.fetch(BASE + path, { method: "POST", body })
     assert.equal(calls.at(-1).headers.has("x-codex-window-id"), false)
     assert.equal(calls.at(-1).headers.has("session-id"), false)
-    assert.equal(calls.at(-1).body, body)
+    // The Messages path gets the Claude Code identity, never the Codex ones.
+    if (path === "/v1/messages") assert.deepEqual(JSON.parse(calls.at(-1).body).system, [CLAUDE_IDENTITY_BLOCK])
+    else assert.equal(calls.at(-1).body, body)
   }
 })
 
@@ -694,6 +1119,31 @@ test("metadata Request inspection honors aborts and timeouts without consuming t
   }
 })
 
+test("Claude completion never forwards a timed-out Request's valid JSON prefix", async (t) => {
+  const plugin = await plugins.Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => auth())
+  let cancelInspection
+  let streamController
+  let upstreamCalls = 0
+  t.mock.method(globalThis, "setTimeout", (callback) => { cancelInspection = callback; return 0 })
+  t.mock.method(globalThis, "clearTimeout", () => {})
+  t.mock.method(globalThis, "fetch", async () => { upstreamCalls++; return json({}) })
+  const body = '{"model":"claude-test","max_tokens":8,"messages":[]}'
+  const stream = new ReadableStream({ start(controller) {
+    streamController = controller
+    controller.enqueue(new TextEncoder().encode(body))
+  } })
+  const request = new Request(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half" })
+  const pending = assert.rejects(loader.fetch(request), /within 15 seconds/)
+  await new Promise((resolve) => setImmediate(resolve))
+  cancelInspection()
+  await pending
+  assert.equal(upstreamCalls, 0)
+  assert.equal(request.bodyUsed, false)
+  streamController.close()
+  assert.equal(await request.text(), body)
+})
+
 test("Codex metadata is isolated between accounts and successive requests", async (t) => {
   const plugin = await plugins.Sub2apiPlugin()
   const first = await plugin.auth.loader(async () => auth({}, "sk-first"))
@@ -752,16 +1202,23 @@ test("agent user agents pass through while configured values remain isolated", a
   const calls = []
   t.mock.method(globalThis, "fetch", async (_, init) => { calls.push(init.headers); return json({}) })
   const accountLoader = await site.auth.loader(async () => auth({ headers: '{"uSeR-aGeNt":"account"}' }, "sk-account"))
-  for (const [plugin, metadata, expected] of [
-    [pooled, {}], [site, {}], [site, { headers: { "user-agent": "" } }],
+  for (const [plugin, metadata, configuredUA] of [
+    [pooled, {}, "global"], [site, {}, "site"], [site, { headers: { "user-agent": "" } }, ""],
   ]) {
     const loader = await plugin.auth.loader(async () => auth(metadata, "sk-other"))
     for (const path of ["responses", "messages", "chat/completions", "models/gemini-test:generateContent"]) {
       await accountLoader.fetch(BASE + "/v1/" + path)
       await loader.fetch(BASE + "/v1/" + path, { headers: { "user-agent": "caller" } })
       await accountLoader.fetch(BASE + "/v1/" + path)
-      assert.deepEqual(calls.slice(-3).map((h) => h.get("user-agent")), ["account", "caller", "account"])
-      assert.deepEqual(calls.slice(-3).map((h) => h.get("authorization")), ["Bearer sk-account", "Bearer sk-other", "Bearer sk-account"])
+      const userAgents = calls.slice(-3).map((headers) => headers.get("user-agent"))
+      assert.equal(userAgents[0], "account")
+      assert.equal(userAgents[2], "account")
+      const expected = path === "responses" || path === "messages"
+        ? configuredUA || (path === "responses" ? CODEX_UA : CLAUDE_UA)
+        : "caller"
+      if (expected instanceof RegExp) assert.match(userAgents[1], expected)
+      else assert.equal(userAgents[1], expected)
+      assert.deepEqual(calls.slice(-3).map((headers) => headers.get("authorization")), ["Bearer sk-account", "Bearer sk-other", "Bearer sk-account"])
     }
   }
 })
