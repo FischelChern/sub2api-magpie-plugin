@@ -922,6 +922,40 @@ test("401 marks sign-in as expired and other model failures propagate without fa
   assert.equal((await plugin.auth.usage(async () => auth())).signIn, undefined)
 })
 
+test("a transient catalog failure stops blocking inference after its cache TTL", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() })
+  const plugin = await plugins.Sub2apiPlugin({}, { query: { modelsTtlMs: 0 } })
+  let modelCalls = 0
+  const calls = []
+  t.mock.method(globalThis, "fetch", async (input) => {
+    const url = String(input)
+    calls.push(url)
+    if (url.endsWith("/v1/models")) {
+      modelCalls++
+      if (modelCalls === 1) throw new TypeError("simulated network failure")
+      return json(modelList)
+    }
+    if (url.includes("/backend-api/codex/models")) return json({ models: [] })
+    return json({ ok: true })
+  })
+  const account = auth()
+  let catalogError
+  try {
+    await plugin.provider.models({ models: {} }, { auth: account })
+  } catch (error) {
+    catalogError = error
+  }
+  assert.equal(catalogError?.message, "Sub2API query failed or timed out")
+  const loader = await plugin.auth.loader(async () => account)
+  const request = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-test", input: "hi" }) }
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", request), /Sub2API query failed or timed out/)
+  t.mock.timers.setTime(Date.now() + 30_001)
+  const response = await loader.fetch(BASE + "/v1/responses", request)
+  assert.equal(response.status, 200)
+  assert.equal(modelCalls, 1)
+  assert.ok(calls.some((url) => url.endsWith("/v1/responses")))
+})
+
 test("manifest failures retain known reasoning levels but malformed model lists fail explicitly", async (t) => {
   const plugin = await plugins.Sub2apiPlugin({}, { query: { modelsTtlMs: 0 } })
   const previous = { "gpt-test": { variants: { medium: {}, high: {} } } }

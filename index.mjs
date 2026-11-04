@@ -56,6 +56,7 @@ const PROTOCOL_IDENTITY_HEADERS = {
   },
 }
 const TIMEOUT = 15_000
+const CATALOG_ERROR_TTL = 30_000
 const METADATA_BODY_MAX = 1 << 20
 const METADATA_HEADERS_MAX = 8 << 10
 const ICON_TIMEOUT = 3_000
@@ -1261,7 +1262,15 @@ function hooks(client, id, site, options) {
       const report = reportFor(auth)
       const scope = accountScope(base, auth.key, headers)
       const catalogKey = fingerprint(scope, routing, modelsFor(auth))
-      const state = () => expired.has(scope) ? { error: expired.get(scope) } : catalogs.get(catalogKey)
+      const state = () => {
+        if (expired.has(scope)) return { error: expired.get(scope) }
+        const catalog = catalogs.get(catalogKey)
+        if (catalog?.error && catalog.expires <= Date.now()) {
+          catalogs.delete(catalogKey)
+          return undefined
+        }
+        return catalog
+      }
       return { baseURL: base + "/v1", apiKey: auth.key, headers, fetch: accountFetch(base, auth.key, headers, routing, protocolHeaders, report, state) }
     },
     methods: [
@@ -1317,7 +1326,13 @@ function hooks(client, id, site, options) {
           })
           return found
         } catch (e) {
-          cacheSet(catalogs, catalogKey, { error: e })
+          // Cache the failure briefly so an already-created transport fails
+          // closed once, but never wedge it until the next successful refresh.
+          // Sign-in expiry stays blocking through the `expired` map below.
+          cacheSet(catalogs, catalogKey, {
+            error: e,
+            expires: e?.signIn ? Number.POSITIVE_INFINITY : Date.now() + CATALOG_ERROR_TTL,
+          })
           report("models.failed", { status: e.status ?? 0, reason: e.kind ?? "configuration" })
           // Never replace an unavailable model with the host's or another key's
           // catalog, and never return an old list as a successful refresh.
