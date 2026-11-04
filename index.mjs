@@ -72,6 +72,7 @@ const QUERY_DEFAULTS = {
 const CACHE_MAX = 128
 const LEGACY_SPEED_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
+const ANTHROPIC_FAST_BETA = "fast-mode-2026-02-01"
 
 const HOUR = 3600
 const DAY = 24 * HOUR
@@ -574,8 +575,10 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     const body = init?.body
     let payload
     let model = ""
+    const inspectFast = protocol === "anthropic" && suffix === "messages"
+      && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")
     // Never consume streaming init.body uploads; Request inspection uses a bounded clone.
-    if (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
+    if ((state?.ids || inspectFast) && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
       try {
         payload = JSON.parse(await metadataBody(input, init))
       } catch {}
@@ -644,6 +647,14 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
     if (protocol === "anthropic" && !headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")
+    // omp/pi and other clients may send native speed without the preview beta.
+    // Keep the selected speed and existing betas; never enable fast from a UA.
+    if (inspectFast && payload?.speed === "fast") {
+      const beta = headers.get("anthropic-beta")
+      if (!beta?.split(",").some((token) => token.trim() === ANTHROPIC_FAST_BETA)) {
+        headers.set("anthropic-beta", beta ? `${beta},${ANTHROPIC_FAST_BETA}` : ANTHROPIC_FAST_BETA)
+      }
+    }
     if (protocol === "gemini" || headers.has("x-goog-api-key")) headers.set("x-goog-api-key", key)
     // Never follow a redirect with this account's extra headers or API key.
     const destination = target.href === url.href ? input
