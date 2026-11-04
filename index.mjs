@@ -40,12 +40,21 @@ const PROTOCOL_USER_AGENTS = {
   "chat-completions": "OpenAI/JS",
   gemini: "google-genai-sdk",
 }
-// Official Codex clients announce themselves through their user agent, their
-// originator or their x-codex-* headers. The same marks decide whether a
-// request's Codex identity is forwarded as sent or masqueraded (see
-// masqueradeCodexIdentity).
+// Agents announce themselves through their user agent and identity headers.
+// Whether an official client's own identity is forwarded or masqueraded is
+// decided the way sub2api's only-official gates decide it: the Codex gate
+// (backend/internal/pkg/openai/request.go) wants an official client family
+// prefix or UA trailer plus a parseable {client}/{X.Y.Z} version, and
+// claude_code_only (backend/internal/service/claude_code_validator.go) wants
+// claude-cli/<major>.<minor>.<patch>. The broader CODEX_UA_RE and
+// CODEX_ORIGINATOR_RE only choose UA defaults on Chat Completions and Gemini.
+// All of these marks are a compatibility heuristic, not proof that the caller
+// is the official client.
 const CODEX_UA_RE = /^(?:codex|codex_cli_rs|codex_exec|codex_vscode|acp-extension-codex)/
 const CODEX_ORIGINATOR_RE = /^(?:codex|acp-extension-codex)/
+const CODEX_OFFICIAL_UA_RE = /^(?:codex_cli_rs|codex-tui|codex_vscode_copilot|codex_vscode|codex_app|codex_chatgpt_desktop|codex_atlas|codex_exec|codex_sdk_ts)\/|^codex /
+const CODEX_OFFICIAL_FAMILY_RE = /^(?:codex_cli_rs|codex-tui|codex_vscode_copilot|codex_vscode|codex_app|codex_chatgpt_desktop|codex_atlas|codex_exec|codex_sdk_ts)$|^codex /
+const CLAUDE_UA_RE = /^claude-cli\/(\d+\.\d+\.\d+)/
 const PROTOCOL_IDENTITY_HEADERS = {
   codex: {
     "openai-beta": "responses=experimental",
@@ -74,6 +83,30 @@ const CACHE_MAX = 128
 const LEGACY_SPEED_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
 const ANTHROPIC_FAST_BETA = "fast-mode-2026-02-01"
+// A sub2api site restricted to official Claude clients (claude_code_only) runs
+// the Messages body through ClaudeCodeValidator.Validate
+// (backend/internal/service/claude_code_validator.go, pinned commit
+// 251094436325175c9e0ab06e7b962d05369fd766): the system array must hold a text
+// block at Dice similarity 0.5 or more with one of the Claude Code prompts,
+// x-app, anthropic-beta and anthropic-version must be non-empty, and
+// metadata.user_id must parse (service/metadata_userid.go). The exact identity
+// prose scores 1.0 against itself, so one block completes the check without
+// imitating a billing block.
+const CLAUDE_IDENTITY_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+// BetaClaudeCode (backend/internal/pkg/claude/constants.go) is the identity
+// token the official client sends; the gate only checks that the header is
+// non-empty, so it is added only when the caller sends no beta at all.
+const CLAUDE_CODE_BETA = "claude-code-20250219"
+// This plugin's own ceiling for rewriting a Messages body; sub2api's gate has
+// no body limit, and the 1 MiB window above is only for header metadata. A real
+// prompt must not become incompatible merely for being larger than that window.
+const CLAUDE_BODY_MAX = 32 << 20
+// ParseMetadataUserID's legacy form: user_<64 hex>_account_<hex or empty>_
+// session_<36 hex or hyphen>, anchored and case-insensitive.
+const CLAUDE_LEGACY_USER_ID_RE = /^user_([a-fA-F0-9]{64})_account_([a-fA-F0-9-]*)_session_([a-fA-F0-9-]{36})$/
+// Conversation signals a caller may carry; the same ones the Codex stand-ins
+// read, plus the Claude Code session header, so one conversation keeps one id.
+const CLAUDE_SESSION_HEADERS = ["session-id", "session_id", "x-session-id", "x-claude-code-session-id", "x-opencode-session"]
 
 const HOUR = 3600
 const DAY = 24 * HOUR
@@ -131,18 +164,51 @@ function fallbackUserAgent(protocol, headers, agent) {
   return PROTOCOL_USER_AGENTS[protocol]
 }
 
-// nativeCodexCaller is true when the request itself carries the official
-// client's marks. Their identity is forwarded exactly as sent; stand-ins
-// would only blur the official client's own ids. Deliberately ignores
-// x-magpie-agent and configured headers: a hint or a site workaround is not
-// proof of the official client.
+// An official Codex UA is what sub2api's codex_cli_only gate accepts without
+// the version-undetectable rejection: an official family prefix (or the engine
+// name in the UA trailer) and a parseable engine version. Only the caller's
+// own headers are inspected, before body metadata promotion and the configured
+// defaults merge, so x-magpie-agent, site headers or body metadata cannot turn
+// a third-party caller official.
 function nativeCodexCaller(headers) {
-  if (CODEX_UA_RE.test(String(headers.get("user-agent") ?? "").trim().toLowerCase())) return true
-  if (CODEX_ORIGINATOR_RE.test(String(headers.get("originator") ?? "").trim().toLowerCase())) return true
-  for (const name of headers.keys()) {
-    if (name.startsWith("x-codex-") || name === "x-openai-subagent") return true
-  }
-  return false
+  const userAgent = String(headers.get("user-agent") ?? "").trim()
+  if (!userAgent || !codexEngineVersion(userAgent)) return false
+  const lower = userAgent.toLowerCase()
+  if (CODEX_OFFICIAL_UA_RE.test(lower)) return true
+  return CODEX_OFFICIAL_FAMILY_RE.test(codexUATrailer(lower))
+}
+
+// nativeClaudeCaller mirrors the claude_code_only UA test. The gate also reads
+// the Messages body (a Claude Code system block, metadata.user_id) and wants
+// non-empty x-app, anthropic-beta and anthropic-version. Only the UA decides
+// whether a caller's own identity and body are forwarded as sent; a third-party
+// caller is given the Claude Code UA, the missing compatibility headers, and a
+// completed body (claudeCompletedBody) instead.
+function nativeClaudeCaller(headers) {
+  return CLAUDE_UA_RE.test(String(headers.get("user-agent") ?? "").trim().toLowerCase())
+}
+
+// codexEngineVersion is the {client}/{X.Y.Z} segment codex-rs writes in its UA.
+// sub2api parses the same segment: first '/', up to the first space or bracket.
+function codexEngineVersion(userAgent) {
+  const slash = userAgent.indexOf("/")
+  if (slash < 0) return ""
+  const rest = userAgent.slice(slash + 1)
+  const end = rest.search(/[ (]/)
+  return /^\d+\.\d+\.\d+/.exec(end < 0 ? rest : rest.slice(0, end))?.[0] ?? ""
+}
+
+// codexUATrailer is the "(name; version)" client name at the end of a
+// codex-rs UA; CODEX_INTERNAL_ORIGINATOR_OVERRIDE changes the prefix but not
+// this trailer, so official clients stay recognizable.
+function codexUATrailer(userAgent) {
+  const open = userAgent.lastIndexOf("(")
+  if (open < 0) return ""
+  const close = userAgent.indexOf(")", open + 1)
+  if (close < 0) return ""
+  const inner = userAgent.slice(open + 1, close).trim()
+  const semicolon = inner.indexOf(";")
+  return (semicolon < 0 ? inner : inner.slice(0, semicolon)).trim()
 }
 
 // stableUUID derives a UUID-v4-shaped id from its parts: same parts, same id.
@@ -175,6 +241,101 @@ function masqueradeCodexIdentity(base, key, model, headers) {
 
 function fingerprint(...parts) {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex")
+}
+
+// claudePromptText is the gate's normalizePrompt: every whitespace run becomes
+// one space and the ends are trimmed, so a block matches apart from formatting.
+function claudePromptText(text) {
+  return String(text).split(/\s+/).join(" ").trim()
+}
+
+// parsesClaudeUserID mirrors ParseMetadataUserID: the JSON form when device_id
+// and session_id are non-empty strings (encoding/json reads keys
+// case-insensitively and fails a string field of another type), else the
+// legacy concatenated form.
+function parsesClaudeUserID(value) {
+  if (typeof value !== "string") return false
+  const raw = value.trim()
+  if (!raw) return false
+  if (raw[0] !== "{") return CLAUDE_LEGACY_USER_ID_RE.test(raw)
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false
+  const fields = Object.create(null)
+  for (const [name, field] of Object.entries(parsed)) {
+    const key = name.toLowerCase()
+    if (key !== "device_id" && key !== "account_uuid" && key !== "session_id") continue
+    // Go's encoding/json leaves string fields unchanged for null values.
+    if (field === null) continue
+    if (typeof field !== "string") return false
+    fields[key] = field
+  }
+  return Boolean(fields.device_id) && Boolean(fields.session_id)
+}
+
+// claudeSessionScope is the caller's own conversation signal, if it carries one.
+function claudeSessionScope(headers) {
+  for (const name of CLAUDE_SESSION_HEADERS) {
+    const value = String(headers.get(name) ?? "").trim()
+    if (value) return value
+  }
+  return ""
+}
+
+// claudeStandInUserID is the user_id a caller without a parseable one gets: the
+// JSON form, stable per account and per conversation, derived through sha256 so
+// the account key itself never appears in it.
+function claudeStandInUserID(base, key, session) {
+  return JSON.stringify({
+    device_id: fingerprint("claude-device", base, key),
+    account_uuid: stableUUID(base, key, "claude-account"),
+    session_id: stableUUID(base, key, session, "claude-session"),
+  })
+}
+
+// claudeSystemBlocks keeps the caller's system as sent — a string becomes one
+// text block holding that text, an array keeps every entry — and puts the
+// identity block first. The gate only reads a block array, so a string system
+// is always converted even when its text is the identity prose. Undefined means
+// the caller's own array already carries the identity block.
+function claudeSystemBlocks(system) {
+  if (system === undefined || system === null) return [{ type: "text", text: CLAUDE_IDENTITY_PROMPT }]
+  if (typeof system === "string") {
+    if (!system) return [{ type: "text", text: CLAUDE_IDENTITY_PROMPT }]
+    const block = { type: "text", text: system }
+    return system.length <= 512 && claudePromptText(system) === CLAUDE_IDENTITY_PROMPT
+      ? [block] : [{ type: "text", text: CLAUDE_IDENTITY_PROMPT }, block]
+  }
+  if (!Array.isArray(system)) {
+    throw new Error("A Claude Messages request carries a system field of an unsupported type; only a string or a block array can be forwarded to this Sub2API account")
+  }
+  // Compare only short identity blocks; do not normalize megabytes of prompt
+  // text just to check whether the compatibility prefix already exists.
+  const matches = (block) => typeof block?.text === "string" && block.text.length <= 512 && claudePromptText(block.text) === CLAUDE_IDENTITY_PROMPT
+  if (system.some(matches)) return
+  return [{ type: "text", text: CLAUDE_IDENTITY_PROMPT }, ...system]
+}
+
+// claudeMetadata keeps every other metadata field and a user_id the gate can
+// parse; undefined means the caller's own metadata already does.
+function claudeMetadata(metadata, base, key, session) {
+  const fields = metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : {}
+  if (parsesClaudeUserID(fields.user_id)) return
+  return { ...fields, user_id: claudeStandInUserID(base, key, session) }
+}
+
+// claudeCompletedBody is the body a Claude-only site's gate accepts, or
+// undefined when the caller's body already passes it. Nothing else is added or
+// changed: no billing block, model, max_tokens, speed, tools or messages.
+function claudeCompletedBody(payload, base, key, headers) {
+  const system = claudeSystemBlocks(payload.system)
+  const metadata = claudeMetadata(payload.metadata, base, key, claudeSessionScope(headers))
+  if (!system && !metadata) return
+  return JSON.stringify({ ...payload, ...(system ? { system } : {}), ...(metadata ? { metadata } : {}) })
 }
 
 function querySettings(...layers) {
@@ -472,14 +633,16 @@ function validatePrices(selection) {
   return selection
 }
 
-async function metadataBody(input, init) {
-  const body = init?.body
-  if (typeof body === "string") return Buffer.byteLength(body) <= METADATA_BODY_MAX ? body : undefined
+async function metadataBody(input, init, max = METADATA_BODY_MAX) {
+  // init.body null is how clients spell "no body", and fetch then uses the
+  // Request's own body, so it is treated as absent here too.
+  const body = init?.body ?? undefined
+  if (typeof body === "string") return Buffer.byteLength(body) <= max ? body : undefined
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    if (body.byteLength > METADATA_BODY_MAX) return
+    if (body.byteLength > max) return
     return new TextDecoder().decode(body)
   }
-  if (body instanceof Blob) return body.size <= METADATA_BODY_MAX ? body.text() : undefined
+  if (body instanceof Blob) return body.size <= max ? body.text() : undefined
   // Do not consume streaming init.body uploads. A Request is inspected via a
   // bounded clone so its original body remains available to fetch.
   if (body !== undefined || !(input instanceof Request) || !input.body || input.bodyUsed) return
@@ -487,16 +650,18 @@ async function metadataBody(input, init) {
   if (signal?.aborted) return
   const reader = input.clone().body.getReader()
   const cancel = () => { reader.cancel().catch(() => {}) }
-  const timer = setTimeout(cancel, TIMEOUT)
+  let timedOut = false
+  const timer = setTimeout(() => { timedOut = true; cancel() }, TIMEOUT)
   signal?.addEventListener("abort", cancel, { once: true })
   const chunks = []
   let size = 0
   try {
     while (true) {
       const { done, value } = await reader.read()
+      if (timedOut || signal?.aborted) return
       if (done) return Buffer.concat(chunks, size).toString("utf8")
       size += value.byteLength
-      if (size > METADATA_BODY_MAX) return
+      if (size > max) return
       chunks.push(Buffer.from(value))
     }
   } finally {
@@ -573,16 +738,56 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     if (LEGACY_SPEED_HEADERS.some((header) => headers.has(header))) {
       throw new Error("Legacy speed models are no longer supported; refresh the model catalog and select speed on the original model")
     }
-    const body = init?.body
+    // Only an actual Messages inference request carries a body this plugin can
+    // complete; a bodyless GET (message list, probes) is forwarded untouched,
+    // and init.body null means the Request's own body, if any.
+    const body = init?.body ?? undefined
     let payload
     let model = ""
-    const inspectFast = protocol === "anthropic" && suffix === "messages"
-      && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")
-    // Never consume streaming init.body uploads; Request inspection uses a bounded clone.
-    if ((state?.ids || inspectFast) && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
+    const encoded = headers.has("content-encoding") && headers.get("content-encoding") !== "identity"
+    // Native status comes from the caller's own merged inbound headers, before
+    // body metadata is promoted and before configured defaults merge: a hint, a
+    // site header or a body field is not proof of the official client.
+    const targetAgent = protocol === "responses" ? "codex" : protocol === "anthropic" ? "claude" : ""
+    const native = targetAgent === "codex" ? nativeCodexCaller(headers)
+      : targetAgent === "claude" ? nativeClaudeCaller(headers)
+      : false
+    const inspectFast = protocol === "anthropic" && suffix === "messages" && !encoded
+    // A Claude-only site validates the Messages body, so every caller that is
+    // not the official client gets it completed below.
+    const completeClaude = protocol === "anthropic" && suffix === "messages" && !native
+    const textualBody = typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob
+    const streamedInput = body === undefined && input instanceof Request && !!input.body && !input.bodyUsed
+    if (completeClaude) {
+      if (body !== undefined && !textualBody) {
+        throw new Error("A Claude Messages request body must be a string, bytes or a Blob to be completed for this Sub2API account; a streaming request body cannot be completed")
+      }
+      if (encoded) {
+        throw new Error("A Claude Messages request body must be uncompressed to be completed for this Sub2API account; remove content-encoding")
+      }
+    }
+    // Never consume streaming init.body uploads; Request inspection uses a
+    // bounded clone, and a Messages body gets this plugin's own 32 MiB ceiling.
+    const readable = textualBody || streamedInput || (body === undefined && input instanceof Request && !input.bodyUsed)
+    let bodyText
+    if ((state?.ids || inspectFast || completeClaude) && readable) {
       try {
-        payload = JSON.parse(await metadataBody(input, init))
+        bodyText = await metadataBody(input, init, completeClaude ? CLAUDE_BODY_MAX : METADATA_BODY_MAX)
+      } catch (error) {
+        if (completeClaude) throw error
+      }
+      try {
+        payload = JSON.parse(bodyText)
       } catch {}
+    }
+    if (completeClaude && (textualBody || streamedInput)) {
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
+      if (bodyText === undefined) {
+        // An aborted request never reaches the upstream gate; fetch raises it.
+        if (!signal?.aborted) throw new Error("A Claude Messages request body must be at most 32 MiB and readable within 15 seconds to be completed for this Sub2API account")
+      } else if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("A Claude Messages request body must be a JSON object to be completed for this Sub2API account")
+      }
     }
     if (state?.ids && typeof payload?.model === "string" && !state.ids.has(payload.model)) {
       const match = /^(.*)-(fast|ultraspeed|ultrafast)$/.exec(payload.model)
@@ -605,49 +810,77 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       headers.delete("content-length")
       report("inference.speed_migrated", { protocol })
     }
+    // Complete what the Claude Code gate reads: the identity system block and a
+    // parseable metadata.user_id. A body that already carries both is forwarded
+    // byte for byte, and nothing else in it is added or changed.
+    if (completeClaude && payload) {
+      const completed = claudeCompletedBody(payload, base, key, headers)
+      if (completed !== undefined) {
+        init = { ...init, body: completed }
+        headers.delete("content-length")
+      }
+    }
     if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
       model = await codexMetadataHeaders(input, init, headers)
     }
-    // The calling request alone decides whether its Codex identity is
-    // forwarded as sent; configured headers must not turn a third-party
-    // caller native. Evaluated before the configured defaults merge below.
-    const nativeCodex = protocol === "responses" && nativeCodexCaller(headers)
     // Built-in identity < protocol headers < global/site/account headers.
     // Agent-provided headers still win, except Magpie's own UA, which a plugin
     // provider is given instead of the calling agent's and must not forward.
     const configured = new Headers(protocolExtra[protocol])
     new Headers(extra).forEach((value, name) => configured.set(name, value))
-    // Detect the agent before protocol defaults can masquerade as caller hints.
-    const identity = new Headers(configured)
-    headers.forEach((value, name) => identity.set(name, value))
-    const agent = callingAgent(identity) || (protocol === "responses" ? "codex" : protocol === "anthropic" ? "claude" : "")
+    // Responses and Messages speak as the official client of the protocol they
+    // call; Chat Completions and Gemini keep the earlier agent-based defaults.
+    let agent = targetAgent
+    if (!agent) {
+      // Detect the agent before protocol defaults can masquerade as caller hints.
+      const identity = new Headers(configured)
+      headers.forEach((value, name) => identity.set(name, value))
+      agent = callingAgent(identity)
+    }
     if (protocol) {
       new Headers(PROTOCOL_IDENTITY_HEADERS[agent]).forEach((value, name) => {
         if (!configured.has(name)) configured.set(name, value)
       })
-      if (agent === "codex" && !configured.has("version")) configured.set("version", codexVersion(identity))
+      if (agent === "codex" && !configured.has("version")) configured.set("version", codexVersion(headers))
     }
     configured.forEach((value, name) => {
       if (name !== "user-agent" && !headers.has(name)) headers.set(name, value)
     })
     const requestedUA = String(headers.get("user-agent") ?? "").trim()
     const configuredUA = String(configured.get("user-agent") ?? "").trim()
-    if (protocol && (!requestedUA || isMagpieUserAgent(requestedUA))) {
-      headers.set("user-agent", configuredUA && !isMagpieUserAgent(configuredUA) ? configuredUA : fallbackUserAgent(protocol, headers, agent))
-    } else if (!requestedUA && configuredUA && !isMagpieUserAgent(configuredUA)) {
-      headers.set("user-agent", configuredUA)
+    const explicitUA = configuredUA && !isMagpieUserAgent(configuredUA) ? configuredUA : ""
+    const magpieUA = !requestedUA || isMagpieUserAgent(requestedUA)
+    if (targetAgent) {
+      // An official caller keeps the UA it sent; defaults only fill a missing or
+      // Magpie UA. Every other caller is given the protocol family's official
+      // UA, because an only-official site rejects the obviously third-party UA
+      // such a caller sends. An explicit configured UA still overrides that
+      // stand-in, but never the UA of an official caller.
+      if (!native || magpieUA) headers.set("user-agent", explicitUA || fallbackUserAgent(protocol, headers, agent))
+    } else if (protocol && magpieUA) {
+      headers.set("user-agent", explicitUA || fallbackUserAgent(protocol, headers, agent))
+    } else if (!requestedUA && explicitUA) {
+      headers.set("user-agent", explicitUA)
     }
     // A sub2api site restricted to official Codex clients (codex_cli_only)
     // refuses requests without the engine fingerprint the client always
     // carries. Native Codex callers forward their own conversation ids; every
     // other responses caller is given stable stand-ins, after the configured
     // headers above so an explicit value always wins over a stand-in.
-    if (protocol === "responses" && !nativeCodex) masqueradeCodexIdentity(base, key, model, headers)
+    if (protocol === "responses" && !native) masqueradeCodexIdentity(base, key, model, headers)
     headers.delete("x-magpie-agent")
     headers.delete("x-magpie-via")
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
     if (protocol === "anthropic" && !headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")
+    // The gate wants non-empty x-app, anthropic-beta and anthropic-version. A
+    // caller's own values are kept; only an empty or missing one is filled in,
+    // with the beta token the official client sends.
+    if (completeClaude) {
+      if (!String(headers.get("x-app") ?? "").trim()) headers.set("x-app", "cli")
+      if (!String(headers.get("anthropic-version") ?? "").trim()) headers.set("anthropic-version", "2023-06-01")
+      if (!String(headers.get("anthropic-beta") ?? "").trim()) headers.set("anthropic-beta", CLAUDE_CODE_BETA)
+    }
     // omp/pi and other clients may send native speed without the preview beta.
     // Keep the selected speed and existing betas; never enable fast from a UA.
     if (inspectFast && payload?.speed === "fast") {
@@ -886,7 +1119,7 @@ function queries(onExpired) {
       }).catch((error) => {
         entry.pending = false
         if (error.signIn) {
-          onExpired(scope, error)
+          onExpired(scope, error, operation)
           for (const name of cache.keys()) if (name.startsWith(scope + ":")) cache.delete(name)
         } else if (operation === "efforts") entry.expires = Date.now() + 30_000
         else if (cache.get(name) === entry) cache.delete(name)
@@ -972,7 +1205,8 @@ async function codexModels(query, base, key, extra, settings, report) {
   let body
   try {
     body = await query(base, "/backend-api/codex/models", key, extra, settings, report, "efforts")
-  } catch {
+  } catch (error) {
+    if (error.signIn) throw error
     return {}
   }
   const out = Object.create(null)
@@ -1191,8 +1425,14 @@ function pluginSettings(options, site) {
 
 function hooks(client, id, site, options) {
   const catalogs = new Map()
-  const expired = new Map()
-  const query = queries((scope, error) => { cacheSet(expired, scope, error) })
+  // Keep the last invalidation after recovery so an older refresh cannot
+  // become current again merely because the sign-in error was cleared.
+  const authStates = new Map()
+  const query = queries((scope, error, operation) => {
+    // Usage is an independent auth probe. Model-query failures belong to a
+    // logical refresh and are handled below only if it has not been replaced.
+    if (operation === "usage") cacheSet(authStates, scope, { error, expired: true })
+  })
   const settings = pluginSettings(options, site)
   const queryFor = (auth) => querySettings({ query: settings.query }, auth?.metadata)
   const modelsFor = (auth) => validatePrices(modelSettings(settings.models, auth?.metadata))
@@ -1263,11 +1503,13 @@ function hooks(client, id, site, options) {
       const scope = accountScope(base, auth.key, headers)
       const catalogKey = fingerprint(scope, routing, modelsFor(auth))
       const state = () => {
-        if (expired.has(scope)) return { error: expired.get(scope) }
+        const authState = authStates.get(scope)
+        if (authState?.expired) return { error: authState.error }
         const catalog = catalogs.get(catalogKey)
         if (catalog?.error && catalog.expires <= Date.now()) {
-          catalogs.delete(catalogKey)
-          return undefined
+          // Error expiry must not discard model IDs and legacy tier metadata.
+          delete catalog.error
+          delete catalog.expires
         }
         return catalog
       }
@@ -1315,24 +1557,40 @@ function hooks(client, id, site, options) {
         const report = reportFor(auth)
         const scope = accountScope(base, auth.key, headers)
         const catalogKey = fingerprint(scope, routing, selection)
+        // The entry identifies the latest refresh without losing the last
+        // usable IDs/tiers while a new query is pending or temporarily fails.
+        const catalog = { ...catalogs.get(catalogKey) }
+        const authAtStart = authStates.get(scope)
+        cacheSet(catalogs, catalogKey, catalog)
         // Cosmetic discovery must not hold up the account's model catalog.
         void refreshIcon(base, true).catch(() => report("icon.failed"))
         try {
           const found = await models(id, base, auth, provider?.models, headers, routing, settings, selection, query, report)
-          expired.delete(scope)
-          cacheSet(catalogs, catalogKey, {
-            ids: new Set(Object.keys(found)),
-            tiers: new Map(Object.entries(found).map(([model, metadata]) => [model, [...metadata.serviceTiers]])),
-          })
+          const currentAuth = authStates.get(scope)
+          if (currentAuth?.error && currentAuth.error !== authAtStart?.error) throw currentAuth.error
+          if (currentAuth && currentAuth !== authAtStart && catalogs.get(catalogKey) !== catalog) {
+            throw queryError("Sub2API model refresh was superseded", undefined, "superseded")
+          }
+          if (catalogs.get(catalogKey) === catalog) {
+            cacheSet(authStates, scope, { error: currentAuth?.error, expired: false })
+            cacheSet(catalogs, catalogKey, {
+              ids: new Set(Object.keys(found)),
+              tiers: new Map(Object.entries(found).map(([model, metadata]) => [model, [...metadata.serviceTiers]])),
+            })
+          }
           return found
         } catch (e) {
-          // Cache the failure briefly so an already-created transport fails
-          // closed once, but never wedge it until the next successful refresh.
-          // Sign-in expiry stays blocking through the `expired` map below.
-          cacheSet(catalogs, catalogKey, {
-            error: e,
-            expires: e?.signIn ? Number.POSITIVE_INFINITY : Date.now() + CATALOG_ERROR_TTL,
-          })
+          const currentCatalog = catalogs.get(catalogKey)
+          if (e?.signIn && (!currentCatalog || currentCatalog === catalog)) {
+            cacheSet(authStates, scope, { error: e, expired: true })
+          }
+          // Only the latest refresh can replace this account's catalog state.
+          // Retain IDs/tiers for legacy normalization when an ordinary error
+          // expires; sign-in failures remain separate in the account auth state.
+          if (currentCatalog === catalog) {
+            catalog.error = e
+            catalog.expires = e?.signIn ? Number.POSITIVE_INFINITY : Date.now() + CATALOG_ERROR_TTL
+          }
           report("models.failed", { status: e.status ?? 0, reason: e.kind ?? "configuration" })
           // Never replace an unavailable model with the host's or another key's
           // catalog, and never return an old list as a successful refresh.

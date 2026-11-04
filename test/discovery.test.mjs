@@ -169,6 +169,217 @@ test("401 invalidates this key's cached models but leaves other accounts intact"
   assert.equal(calls.length, 4)
 })
 
+test("an in-flight model refresh cannot clear a newer usage 401", { timeout: 1000 }, async (t) => {
+  let releaseManifest
+  let manifestStarted
+  let inferenceCalls = 0
+  const started = new Promise((resolve) => { manifestStarted = resolve })
+  mockAPI(t, ({ url }) => {
+    if (url.endsWith("/v1/models")) return Response.json(catalog("gpt-test"))
+    if (url.includes("/backend-api/")) {
+      manifestStarted()
+      return new Promise((resolve) => { releaseManifest = () => resolve(Response.json({ models: [] })) })
+    }
+    if (url.endsWith("/usage")) return new Response(null, { status: 401 })
+    inferenceCalls++
+    return Response.json({ ok: true })
+  })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const refresh = assert.rejects(plugin.provider.models(previous, { auth: account() }), (error) => error.signIn === "expired")
+  await started
+  assert.equal((await plugin.auth.usage(async () => account())).signIn, "expired")
+  releaseManifest()
+  await refresh
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"gpt-test"}' }), (error) => error.signIn === "expired")
+  assert.equal(inferenceCalls, 0)
+  const other = await plugin.auth.loader(async () => account("synthetic-key-b"))
+  assert.equal((await other.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"gpt-test"}' })).status, 200)
+  assert.equal(inferenceCalls, 1)
+})
+
+test("invalidated late refresh failures cannot replace a newer recovered catalog", async (t) => {
+  for (const status of [503, 401]) {
+    await t.test(String(status), { timeout: 1000 }, async (t) => {
+      let releaseOld
+      let oldStarted
+      let modelCalls = 0
+      let inferenceCalls = 0
+      const started = new Promise((resolve) => { oldStarted = resolve })
+      mockAPI(t, ({ url }) => {
+        if (url.endsWith("/v1/models")) {
+          modelCalls++
+          if (modelCalls === 1) {
+            oldStarted()
+            return new Promise((resolve) => { releaseOld = () => resolve(new Response(null, { status })) })
+          }
+          return Response.json(catalog("own-model"))
+        }
+        if (url.endsWith("/usage")) return new Response(null, { status: 401 })
+        inferenceCalls++
+        return Response.json({ ok: true })
+      })
+      const plugin = await Sub2apiPlugin()
+      const loader = await plugin.auth.loader(async () => account())
+      const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), (error) => error.status === status)
+      await started
+      assert.equal((await plugin.auth.usage(async () => account())).signIn, "expired")
+      const found = await plugin.provider.models(previous, { auth: account() })
+      assert.deepEqual(Object.keys(found), ["own-model"])
+      const request = { method: "POST", body: '{"model":"own-model"}' }
+      assert.equal((await loader.fetch(BASE + "/v1/chat/completions", request)).status, 200)
+      releaseOld()
+      await old
+      assert.equal((await loader.fetch(BASE + "/v1/chat/completions", request)).status, 200)
+      assert.equal(inferenceCalls, 2)
+      assert.equal(modelCalls, 2)
+    })
+  }
+})
+
+test("a late successful refresh cannot restore an older catalog", { timeout: 1000 }, async (t) => {
+  let releaseOld
+  let oldStarted
+  let modelCalls = 0
+  const started = new Promise((resolve) => { oldStarted = resolve })
+  mockAPI(t, ({ url }) => {
+    if (!url.endsWith("/v1/models")) return Response.json({ ok: true })
+    if (++modelCalls === 1) {
+      oldStarted()
+      return new Promise((resolve) => { releaseOld = () => resolve(Response.json(catalog("old-model"))) })
+    }
+    return Response.json(catalog("new-model"))
+  })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), /superseded/)
+  await started
+  const found = await plugin.provider.models(previous, { auth: account("synthetic-key-a", BASE, { query: { timeoutMs: 1000 } }) })
+  assert.deepEqual(Object.keys(found), ["new-model"])
+  releaseOld()
+  await old
+  assert.equal((await loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"new-model"}' })).status, 200)
+  await assert.rejects(loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"old-model"}' }), /not listed/)
+})
+
+test("a manifest 401 remains an authentication failure rather than a successful refresh", async (t) => {
+  const calls = mockAPI(t, ({ url }) => url.includes("/backend-api/") ? new Response(null, { status: 401 }) : Response.json(catalog("gpt-test")))
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const results = await Promise.allSettled([
+    plugin.provider.models(previous, { auth: account() }),
+    plugin.provider.models(previous, { auth: account() }),
+  ])
+  for (const result of results) {
+    assert.equal(result.status, "rejected")
+    assert.equal(result.reason.signIn, "expired")
+  }
+  assert.equal(calls.filter(({ url }) => url.endsWith("/v1/models")).length, 1)
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", { method: "POST", body: '{"model":"gpt-test"}' }), (error) => error.signIn === "expired")
+})
+
+test("a pre-invalidation refresh stays stale after a newer refresh has recovered", { timeout: 1000 }, async (t) => {
+  let releaseOld
+  let oldStarted
+  let modelCalls = 0
+  const started = new Promise((resolve) => { oldStarted = resolve })
+  mockAPI(t, ({ url }) => {
+    if (url.endsWith("/v1/models")) return Response.json(catalog(++modelCalls === 1 ? "gpt-old" : "new-model"))
+    if (url.includes("/backend-api/")) {
+      oldStarted()
+      return new Promise((resolve) => { releaseOld = () => resolve(Response.json({ models: [] })) })
+    }
+    if (url.endsWith("/usage")) return new Response(null, { status: 401 })
+    return Response.json({ ok: true })
+  })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), (error) => error.signIn === "expired")
+  await started
+  assert.equal((await plugin.auth.usage(async () => account())).signIn, "expired")
+  assert.deepEqual(Object.keys(await plugin.provider.models(previous, { auth: account() })), ["new-model"])
+  releaseOld()
+  await old
+  assert.equal((await loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"new-model"}' })).status, 200)
+})
+
+test("a usage 401 observed after model success still invalidates the account", { timeout: 1000 }, async (t) => {
+  let releaseUsage
+  let usageStarted
+  const started = new Promise((resolve) => { usageStarted = resolve })
+  mockAPI(t, ({ url }) => {
+    if (url.endsWith("/usage")) {
+      usageStarted()
+      return new Promise((resolve) => { releaseUsage = () => resolve(new Response(null, { status: 401 })) })
+    }
+    return Response.json(catalog("own-model"))
+  })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const usage = plugin.auth.usage(async () => account())
+  await started
+  await plugin.provider.models(previous, { auth: account() })
+  releaseUsage()
+  assert.equal((await usage).signIn, "expired")
+  await assert.rejects(loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"own-model"}' }), (error) => error.signIn === "expired")
+})
+
+test("a superseded model query 401 cannot invalidate a newer refresh with different settings", { timeout: 1000 }, async (t) => {
+  let releaseOld
+  let oldStarted
+  let modelCalls = 0
+  const started = new Promise((resolve) => { oldStarted = resolve })
+  mockAPI(t, ({ url }) => {
+    if (!url.endsWith("/v1/models")) return Response.json({ ok: true })
+    if (++modelCalls === 1) {
+      oldStarted()
+      return new Promise((resolve) => { releaseOld = () => resolve(new Response(null, { status: 401 })) })
+    }
+    return Response.json(catalog("new-model"))
+  })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), (error) => error.signIn === "expired")
+  await started
+  await plugin.provider.models(previous, { auth: account("synthetic-key-a", BASE, { query: { timeoutMs: 1000 } }) })
+  releaseOld()
+  await old
+  assert.equal((await loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"new-model"}' })).status, 200)
+})
+
+test("cache eviction does not suppress current usage or manifest authentication failures", async (t) => {
+  for (const operation of ["usage", "manifest"]) {
+    await t.test(operation, { timeout: 3000 }, async (t) => {
+      let releaseFailure
+      let requestStarted
+      let inferenceCalls = 0
+      const started = new Promise((resolve) => { requestStarted = resolve })
+      mockAPI(t, ({ url, headers }) => {
+        const target = headers.get("authorization") === "Bearer synthetic-key-a"
+        if (url.endsWith("/v1/models")) return Response.json(catalog(target && operation === "manifest" ? "gpt-test" : "own-model"))
+        if (target && (url.endsWith("/usage") || url.includes("/backend-api/"))) {
+          requestStarted()
+          return new Promise((resolve) => { releaseFailure = () => resolve(new Response(null, { status: 401 })) })
+        }
+        inferenceCalls++
+        return Response.json({ ok: true })
+      })
+      const plugin = await Sub2apiPlugin()
+      const loader = await plugin.auth.loader(async () => account())
+      if (operation === "usage") await plugin.provider.models(previous, { auth: account() })
+      const pending = operation === "usage" ? plugin.auth.usage(async () => account())
+        : plugin.provider.models(previous, { auth: account() }).then((value) => ({ value }), (error) => ({ error }))
+      await started
+      await Promise.all(Array.from({ length: 129 }, (_, index) => plugin.provider.models(previous, { auth: account("eviction-key-" + index) })))
+      releaseFailure()
+      const result = await pending
+      assert.equal(operation === "usage" ? result.signIn : result.error?.signIn, "expired")
+      await assert.rejects(loader.fetch(BASE + "/v1/chat/completions", { method: "POST", body: '{"model":"own-model"}' }), (error) => error.signIn === "expired")
+      assert.equal(inferenceCalls, 0)
+    })
+  }
+})
+
 test("failed refreshes never use old or host models, and failed queries are not success-cached", async (t) => {
   let failed = false
   const calls = mockAPI(t, () => failed ? new Response("private error body", { status: 503 }) : Response.json(catalog("own-model")))
