@@ -6,6 +6,7 @@ import { Sub2apiPlugin, Sub2apiSite1 } from "../index.mjs"
 
 const BASE = "https://speeds.example.com/deployment"
 const LEGACY_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
+const FAST_BETA = "fast-mode-2026-02-01"
 const account = (key = "speed-test-key", baseURL = BASE, metadata = {}) => ({ type: "api", key, metadata: { baseURL, ...metadata } })
 const provider = { models: {} }
 
@@ -256,6 +257,85 @@ test("Agent-selected speeds preserve the exact original request, key, response a
     }
   }
   assert.equal(requests.length, 9)
+})
+
+test("native Anthropic fast merges the preview beta after account and caller header precedence", async (t) => {
+  const { requests } = mockAPI(t, { entries: ["claude-alias"] })
+  const plugin = await Sub2apiPlugin({}, {
+    modelProtocols: { "claude-alias": "anthropic" },
+    protocolHeaders: { claude: { "anthropic-beta": "protocol-feature" } },
+  })
+  const auth = account("native-key", BASE, { headers: { "anthropic-beta": "account-feature" } })
+  const loader = await plugin.auth.loader(async () => auth)
+  const body = JSON.stringify({ model: "claude-alias", messages: [], speed: "fast" })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body })
+  assert.equal(requests.at(-1).headers.get("anthropic-beta"), `account-feature,${FAST_BETA}`)
+  await plugin.provider.models(provider, { auth })
+  const request = new Request(BASE + "/v1/messages", {
+    method: "POST", body, headers: { "anthropic-beta": "request-feature" },
+  })
+  await loader.fetch(request, { headers: { "Anthropic-Beta": `caller-feature, ${FAST_BETA}` } })
+  assert.equal(requests.at(-1).headers.get("anthropic-beta"), `caller-feature, ${FAST_BETA}`)
+  assert.equal(request.bodyUsed, false)
+  assert.equal(await request.text(), body)
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "anthropic-beta": "caller-feature" } })
+  assert.equal(requests.at(-1).headers.get("anthropic-beta"), `caller-feature,${FAST_BETA}`)
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: '{"model":"claude-alias","speed":"standard"}' })
+  assert.equal(requests.at(-1).headers.get("anthropic-beta"), "account-feature")
+})
+
+test("fast compatibility never enables speed from an Agent name or another protocol's tier", async (t) => {
+  const { requests, queries } = mockAPI(t)
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  for (const [path, body] of [
+    ["messages", '{"service_tier":"priority"}'],
+    ["messages", '{"speed":"standard"}'],
+    ["messages", '{"speed":true}'],
+    ["messages", '{"metadata":{"speed":"fast"}}'],
+    ["messages", "{broken"],
+    ["messages/count_tokens", '{"speed":"fast"}'],
+    ["responses", '{"speed":"fast","service_tier":"priority"}'],
+    ["chat/completions", '{"speed":"fast","service_tier":"ultrafast"}'],
+    ["models", '{"speed":"fast"}'],
+  ]) {
+    await loader.fetch(BASE + "/v1/" + path, { method: "POST", body, headers: { "user-agent": "claude-cli/test" } })
+    const sent = path === "models" ? queries.at(-1) : requests.at(-1)
+    assert.equal(sent.headers.has("anthropic-beta"), false, path + " " + body)
+    assert.equal(sent.init.body, body)
+  }
+})
+
+test("uninspectable native uploads stay untouched and can carry an explicit fast beta", async (t) => {
+  const { requests } = mockAPI(t)
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account())
+  const body = '{"speed":"fast"}'
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body, headers: { "content-encoding": "gzip" } })
+  assert.equal(requests.at(-1).headers.has("anthropic-beta"), false)
+  const large = JSON.stringify({ speed: "fast", padding: "x".repeat(1 << 20) })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: large })
+  assert.equal(requests.at(-1).headers.has("anthropic-beta"), false)
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); controller.close() } })
+  await loader.fetch(BASE + "/v1/messages", { method: "POST", body: stream, duplex: "half", headers: { "anthropic-beta": FAST_BETA } })
+  assert.equal(stream.locked, false)
+  assert.equal(requests.at(-1).init.body, stream)
+  assert.equal(requests.at(-1).headers.get("anthropic-beta"), FAST_BETA)
+})
+
+test("native fast rejection stays visible without downgrading speed or retrying another account", async (t) => {
+  const rejection = new Response("fast capacity exhausted", { status: 429, headers: { "retry-after": "60" } })
+  const { requests } = mockAPI(t, { reply: () => rejection })
+  const plugin = await Sub2apiPlugin()
+  const loader = await plugin.auth.loader(async () => account("fast-account"))
+  const body = '{"model":"claude-alias","speed":"fast","messages":[]}'
+  const result = await loader.fetch(BASE + "/v1/messages", { method: "POST", body })
+  assert.equal(result, rejection)
+  assert.equal(result.headers.get("retry-after"), "60")
+  assert.equal(await result.text(), "fast capacity exhausted")
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].init.body, body)
+  assert.equal(requests[0].headers.get("authorization"), "Bearer fast-account")
 })
 
 test("concurrent requests keep independently chosen speeds without injecting a default speed", async (t) => {

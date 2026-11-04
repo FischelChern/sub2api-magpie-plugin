@@ -40,6 +40,12 @@ const PROTOCOL_USER_AGENTS = {
   "chat-completions": "OpenAI/JS",
   gemini: "google-genai-sdk",
 }
+// Official Codex clients announce themselves through their user agent, their
+// originator or their x-codex-* headers. The same marks decide whether a
+// request's Codex identity is forwarded as sent or masqueraded (see
+// masqueradeCodexIdentity).
+const CODEX_UA_RE = /^(?:codex|codex_cli_rs|codex_exec|codex_vscode|acp-extension-codex)/
+const CODEX_ORIGINATOR_RE = /^(?:codex|acp-extension-codex)/
 const PROTOCOL_IDENTITY_HEADERS = {
   codex: {
     "openai-beta": "responses=experimental",
@@ -67,6 +73,7 @@ const QUERY_DEFAULTS = {
 const CACHE_MAX = 128
 const LEGACY_SPEED_HEADERS = ["x-sub2api-magpie-plugin-speed-model", "x-magpie-sub2api-speed-model"]
 const SPEEDS = { fast: "priority", ultraspeed: "ultrafast" }
+const ANTHROPIC_FAST_BETA = "fast-mode-2026-02-01"
 
 const HOUR = 3600
 const DAY = 24 * HOUR
@@ -106,12 +113,11 @@ function codexUserAgent(headers) {
 
 function callingAgent(headers) {
   const userAgent = String(headers.get("user-agent") ?? "").trim().toLowerCase()
-  if (/^(codex|codex_cli_rs|codex_exec|codex_vscode|acp-extension-codex)/.test(userAgent)) return "codex"
+  if (CODEX_UA_RE.test(userAgent)) return "codex"
   if (/^claude-cli\//.test(userAgent) || userAgent.includes("claude code")) return "claude"
   const named = String(headers.get("x-magpie-agent") ?? "").trim().toLowerCase()
   if (named === "codex" || named === "claude") return named
-  const originator = String(headers.get("originator") ?? "").trim().toLowerCase()
-  if (/^(codex|acp-extension-codex)/.test(originator)) return "codex"
+  if (CODEX_ORIGINATOR_RE.test(String(headers.get("originator") ?? "").trim().toLowerCase())) return "codex"
   for (const name of headers.keys()) {
     if (name.startsWith("x-codex-") || name === "x-openai-subagent") return "codex"
     if (name.startsWith("x-claude-code-") || name === "x-anthropic-billing-header") return "claude"
@@ -123,6 +129,48 @@ function fallbackUserAgent(protocol, headers, agent) {
   if (agent === "codex") return codexUserAgent(headers)
   if (agent === "claude") return PROTOCOL_USER_AGENTS.anthropic
   return PROTOCOL_USER_AGENTS[protocol]
+}
+
+// nativeCodexCaller is true when the request itself carries the official
+// client's marks. Their identity is forwarded exactly as sent; stand-ins
+// would only blur the official client's own ids. Deliberately ignores
+// x-magpie-agent and configured headers: a hint or a site workaround is not
+// proof of the official client.
+function nativeCodexCaller(headers) {
+  if (CODEX_UA_RE.test(String(headers.get("user-agent") ?? "").trim().toLowerCase())) return true
+  if (CODEX_ORIGINATOR_RE.test(String(headers.get("originator") ?? "").trim().toLowerCase())) return true
+  for (const name of headers.keys()) {
+    if (name.startsWith("x-codex-") || name === "x-openai-subagent") return true
+  }
+  return false
+}
+
+// stableUUID derives a UUID-v4-shaped id from its parts: same parts, same id.
+function stableUUID(...parts) {
+  const hex = fingerprint("codex-identity", ...parts).slice(0, 32)
+  const id = hex.slice(0, 12) + "4" + hex.slice(13, 16) + (8 + (parseInt(hex[16], 16) & 3)).toString(16) + hex.slice(17)
+  return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`
+}
+
+// masqueradeCodexIdentity gives a responses caller that is not Codex itself
+// the conversation identity the official client always carries, for the
+// names nothing else set: session-id/thread-id, x-codex-window-id and
+// x-codex-installation-id. A sub2api site restricted to official Codex
+// clients (codex_cli_only) gates on that fingerprint, so without it every
+// third-party request is refused. Ids stay stable per account and
+// conversation — the caller's own session signal when it carries one
+// (opencode's x-opencode-session or x-session-id), else the calling model —
+// so the gateway's session routing sees one coherent Codex client instead of
+// a new anonymous one per request. Only headers change; the body never does.
+function masqueradeCodexIdentity(base, key, model, headers) {
+  const given = String(headers.get("session-id") ?? headers.get("session_id") ?? "").trim()
+  const conversation = String(headers.get("x-session-id") ?? headers.get("x-opencode-session") ?? "").trim()
+  const scope = conversation || model
+  const session = given || stableUUID(base, key, scope, "session")
+  if (!headers.has("session-id")) headers.set("session-id", session)
+  if (!headers.has("thread-id")) headers.set("thread-id", session)
+  if (!headers.has("x-codex-window-id")) headers.set("x-codex-window-id", stableUUID(base, key, scope, "window"))
+  if (!headers.has("x-codex-installation-id")) headers.set("x-codex-installation-id", stableUUID(base, key, "installation"))
 }
 
 function fingerprint(...parts) {
@@ -464,9 +512,10 @@ async function codexMetadataHeaders(input, init, headers) {
   try {
     payload = JSON.parse(await metadataBody(input, init))
   } catch {
-    return
+    return ""
   }
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return ""
+  const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : ""
   let size = 0
   const setMissing = (name, value) => {
     if (headers.has(name) || headers.has(name.replace(/-/g, "_"))) return
@@ -492,6 +541,7 @@ async function codexMetadataHeaders(input, init, headers) {
     setMissing("session-id", payload.prompt_cache_key)
     setMissing("thread-id", payload.prompt_cache_key)
   }
+  return model
 }
 
 function accountFetch(base, key, extra, routing, protocolExtra = {}, report = () => {}, catalogState = () => undefined) {
@@ -525,8 +575,11 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     }
     const body = init?.body
     let payload
+    let model = ""
+    const inspectFast = protocol === "anthropic" && suffix === "messages"
+      && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")
     // Never consume streaming init.body uploads; Request inspection uses a bounded clone.
-    if (state?.ids && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
+    if ((state?.ids || inspectFast) && (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Blob || (body === undefined && input instanceof Request))) {
       try {
         payload = JSON.parse(await metadataBody(input, init))
       } catch {}
@@ -553,8 +606,12 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
       report("inference.speed_migrated", { protocol })
     }
     if (protocol === "responses" && (!headers.has("content-encoding") || headers.get("content-encoding") === "identity")) {
-      await codexMetadataHeaders(input, init, headers)
+      model = await codexMetadataHeaders(input, init, headers)
     }
+    // The calling request alone decides whether its Codex identity is
+    // forwarded as sent; configured headers must not turn a third-party
+    // caller native. Evaluated before the configured defaults merge below.
+    const nativeCodex = protocol === "responses" && nativeCodexCaller(headers)
     // Built-in identity < protocol headers < global/site/account headers.
     // Agent-provided headers still win, except Magpie's own UA, which a plugin
     // provider is given instead of the calling agent's and must not forward.
@@ -580,11 +637,25 @@ function accountFetch(base, key, extra, routing, protocolExtra = {}, report = ()
     } else if (!requestedUA && configuredUA && !isMagpieUserAgent(configuredUA)) {
       headers.set("user-agent", configuredUA)
     }
+    // A sub2api site restricted to official Codex clients (codex_cli_only)
+    // refuses requests without the engine fingerprint the client always
+    // carries. Native Codex callers forward their own conversation ids; every
+    // other responses caller is given stable stand-ins, after the configured
+    // headers above so an explicit value always wins over a stand-in.
+    if (protocol === "responses" && !nativeCodex) masqueradeCodexIdentity(base, key, model, headers)
     headers.delete("x-magpie-agent")
     headers.delete("x-magpie-via")
     headers.set("authorization", `Bearer ${key}`)
     if (protocol === "anthropic" || headers.has("x-api-key")) headers.set("x-api-key", key)
     if (protocol === "anthropic" && !headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01")
+    // omp/pi and other clients may send native speed without the preview beta.
+    // Keep the selected speed and existing betas; never enable fast from a UA.
+    if (inspectFast && payload?.speed === "fast") {
+      const beta = headers.get("anthropic-beta")
+      if (!beta?.split(",").some((token) => token.trim() === ANTHROPIC_FAST_BETA)) {
+        headers.set("anthropic-beta", beta ? `${beta},${ANTHROPIC_FAST_BETA}` : ANTHROPIC_FAST_BETA)
+      }
+    }
     if (protocol === "gemini" || headers.has("x-goog-api-key")) headers.set("x-goog-api-key", key)
     // Never follow a redirect with this account's extra headers or API key.
     const destination = target.href === url.href ? input

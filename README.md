@@ -12,7 +12,7 @@
 - **余额**：余额计费的 key 显示钱包余额，包括零余额。
 - **模型列表**：自动读取 `GET /v1/models` 的思考等级和快速档位；含 Responses 模型时自动通过同一 key 的 `GET /backend-api/codex/models` 补充缺失信息，无需开启额外选项。辅助接口不可用时保留已知思考等级或使用默认值，不猜测快速权限。
 - **账号绑定**：完整列出每个 API key 返回的模型，支持分页；发送使用所选账号自己的 Base URL、API key 和请求头，不在插件内切换 key 或模型。
-- **原模型速度选择**：读取当前 key 报告的 Fast / Ultraspeed 能力，以 `serviceTiers` 交给 Magpie，让支持该能力的 Agent 在原模型上选择速度，不额外生成模型。
+- **原模型速度选择**：读取当前 key 报告的 Fast / Ultraspeed 能力，以 `serviceTiers` 交给 Magpie；兼容 omp、pi、Claude Code 等客户端已发送的原生速度参数，Anthropic fast 自动补齐兼容 beta 头，不额外生成模型或默认开启加速。
 - **请求指标**：保留四种协议的用量、缓存和流式事件，由 Magpie 原生统计耗时、首响应、token、缓存命中率、输出速度和估算费用，不重复上报账单。
 - **请求头**：支持全局、站点和账号级配置，查询及实际模型发送均生效，大小写不敏感地合并。
 - **多站点/多账号**：可共用 `sub2api` 池，也可配置最多 8 个独立站点 provider。
@@ -158,11 +158,13 @@ Magpie 对插件 provider 发起内部请求时会使用自身的 `magpie/<versi
 
 先识别收到的 Agent 信息，再补充默认头，避免 Responses 默认值把 Claude 调用误判为 Codex。Codex 请求缺失时补齐 `OpenAI-Beta: responses=experimental`、`originator: codex_cli_rs` 和 `version`；已有 `version` 原样保留，缺失时从原始 Codex UA 提取，否则使用兼容版本。自动生成 Codex UA 时优先使用有效的 `version`，真实 UA 不改写。Claude 请求缺失时补充 `x-app: cli`；Messages 协议缺失时补充 `anthropic-version: 2023-06-01`。Agent 提供的 `originator`、`session-id` 和所有 `x-codex-*` 请求头继续保留；`init.headers` 中的同名值会覆盖 `Request.headers`，认证头始终替换为当前账号凭据。
 
-Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，不生成安装、窗口或会话标识，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
+Responses 请求还会从 JSON 请求体的 `client_metadata` 补充缺失的请求头：`session_id` → `session-id`、`thread_id` → `thread-id`，以及名称不变的 `x-codex-*` 字符串字段。与 Magpie 的 Codex 签名一致，`prompt_cache_key` 会作为缺失的 `session-id` 和 `thread-id`。已有请求头（包括 `session_id` / `thread_id` 别名）优先，不复制任意其他字段，也不修改请求体。此转换不应用于 Claude、Chat Completions、Gemini 或管理接口。
+
+当调用方本身不是官方 Codex——没有 Codex UA、`originator` 或 `x-codex-*` 请求头——而走 Responses 协议时，插件会伪装出官方客户端始终携带的会话标识：缺失的 `session-id` / `thread-id`、`x-codex-window-id` 和 `x-codex-installation-id`。这些标识是确定性 UUID，按账号与会话（调用方自带的 `x-session-id` / `x-opencode-session`，否则按请求的模型）保持稳定，不会每个请求轮换，因此网关的会话亲和与用量关联看到的是一个连贯的 Codex 客户端。显式配置的 `protocolHeaders` / `headers` / 账号头优先于伪装值，请求体始终不改写。官方 Codex 调用方的身份与对话 ID 原样透传，不做任何补齐。
 
 元数据检查支持字符串、字节、Blob 和 `Request` 副本，最多读取 1 MiB；副本读取最多等待 15 秒，并响应取消信号。直接通过 `init.body` 传入的 `ReadableStream`、编码后的请求体及过大的请求体不做转换，原样交给 fetch；已提供的 HTTP 头仍保留。无效 JSON 或头值会忽略，新增元数据请求头合计最多 8 KiB。这些头可能包含客户端、会话和本地工作区信息，只应发送给可信供应商；若无需转发某项，请在调用方移除对应元数据。
 
-这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。如果仍返回 `This account only allows Codex official clients`，站点可能还校验请求体或其他客户端特征；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
+这些标识仅用于协议兼容，不会使 Magpie 成为官方客户端，也不改变账号权限。开启 `codex_cli_only`（仅允许官方 Codex 客户端）的站点会校验 Codex 引擎指纹——`x-codex-*` 请求头加上官方身份标识——上述伪装即为兼容调用方提供这一指纹。如果仍返回 `This account only allows Codex official clients`，站点可能还勾选了请求体级别的指纹信号（`client_metadata.x-codex-*`）或配置了更严格的黑白名单；请联系管理员为该账号允许兼容客户端，或使用其支持的官方客户端。
 
 ### 校验和安全边界
 
@@ -304,12 +306,33 @@ Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参�
 ```
 
 - `serviceTiers` 只声明能力，不自动启用速度；空数组明确关闭展示，支持 `fast` → `priority`、`ultraspeed` → `ultrafast` 配置别名。全局 < 站点 < 账号，数组逐层替换。声明不会添加 key 未列出的模型或授予真实权限。
-- 此选择机制用于 Responses / Chat Completions 的 `service_tier`。Anthropic 原生 `speed: "fast"` 请求继续原样透传，但不把 Anthropic 或 Gemini 模型伪装成支持 OpenAI 服务档位；对这些协议显式配置非空 `serviceTiers` 会报错。站点以 OpenAI 兼容协议提供同一模型时，可按实际情况设置 `modelProtocols`。
+- 此选择机制用于 Responses / Chat Completions 的 `service_tier`。Anthropic 原生 `speed: "fast"` 请求保留原始请求体，并在缺少时向最终 `anthropic-beta` 追加 `fast-mode-2026-02-01`，保留已有 beta、不重复追加；`speed: "standard"` 或未选择 fast 时不添加。只处理 `/messages` 推理，不作用于 token 统计、管理接口或其他协议，不把 Anthropic/Gemini 模型伪装成支持 OpenAI 服务档位；对这些协议显式配置非空 `serviceTiers` 会报错。站点以 OpenAI 兼容协议提供同一模型时，可按实际情况设置 `modelProtocols`。
 - 每次请求仍使用所选账号自己的 Base URL、key 和协议路径。标准请求不改写 Agent 选择的模型或速度，不注入默认速度、不预读响应流；不支持时直接返回原始上游错误，不降档、不重试、不换 key 或模型。
 - 需要支持插件 `serviceTiers` 的 Magpie 版本，以及能读取目录和发送对应参数的 Agent。不是所有客户端都会自动出现速度菜单；不支持菜单的客户端可自行设置标准请求参数。宿主在请求到达插件之前可能有自己的参数转换、账号重试或回退；端到端禁止回退须单独关闭这些宿主策略，插件不修改宿主配置。
 - 升级后请重载插件和模型列表，并将原来的合成速度模型选择、筛选、价格覆盖或路由引用改回原模型。为兼容已保存的旧选择，当请求 ID 不在当前 key 目录、去掉末尾 `-fast` / `-ultraspeed` / `-ultrafast` 后的原 ID 在目录中，且该 key 明确声明对应档位时，插件在首次发送前转换为原 ID 加 `service_tier`（Fast 为 `priority`，另两者为 `ultrafast`）。例如 `gpt-6.1-sol-fast` 转为 `gpt-6.1-sol` 加 `service_tier: "priority"`，不增加目录模型，也不在失败后重试。真实存在的完整 ID 优先，绝不去后缀；不猜测空格、连字符或其他别名。能力未知、参数冲突或非 OpenAI 兼容协议直接报错。兼容转换仅处理大小受限的可读 JSON，流式上传不改写；旧合成模型的私有请求头标记仍明确报错，需刷新模型列表。
 - 旧 `speedModels` 不再创建模型：数组仅筛选已报告的加速档，不能凭空声明支持；对象仍兼容按原 ID 显式声明能力，建议迁移到 `modelOverrides.<原模型>.serviceTiers`。默认配置和示例不再包含此旧选项。
 - 原模型价格和用量元数据继续保留。速度可能影响收费；若宿主使用同一套模型单价估算所有速度档，不应把该估算当作加速档实际账单，请以站点计价和实际用量为准。
+
+### omp、pi、Claude Code 与其他 Agent
+
+按**实际请求协议及客户端明确选择的速度**适配，不根据 UA、模型名或思考等级自动启用收费模式。只要请求到达插件时仍包含原生速度参数，就使用所选账号透传；插件不修改客户端配置，也不替客户端新增命令或速度菜单。
+
+| Agent | 客户端入口 | 插件接收的原生参数 |
+| --- | --- | --- |
+| omp | OpenAI 可用 `omp --service-tier priority`；Ultrafast 可用 `--service-tier ultrafast` 或支持版本的 `/fast ultra`；Anthropic 使用 `tier.anthropic: priority` 设置 | OpenAI：`service_tier`；支持的 Anthropic 模型：`speed: "fast"` |
+| pi | 使用能设置 service tier 的版本/扩展；Anthropic 可通过扩展或请求钩子发送 `speed`，不假定 pi 自带 `/fast` | OpenAI：`service_tier`；Anthropic：`speed: "fast"` |
+| Claude Code | `/fast` 或用户设置 `"fastMode": true`；仅客户端支持且账号已获权限的模型 | Anthropic：`speed: "fast"`，插件补齐缺少的兼容 beta |
+| Codex | `/fast`，可选档位取决于客户端版本和同步后的模型目录 | Responses：`service_tier: "priority"` / `"ultrafast"` |
+| OpenCode | 使用支持 fast 的版本及其原生速度配置/请求选项 | 随所选 provider 协议使用 `service_tier` 或 `speed` |
+| Cursor、Cline、Roo Code、Aider、其他兼容客户端 | 客户端允许时在原生请求参数或扩展中设置；不承诺这些客户端内置快速模式菜单 | OpenAI：`service_tier`；Anthropic：`speed` |
+
+- **Magpie 跨协议边界**：本次仅修改 provider 插件。同协议请求可携带客户端原生速度；跨协议到 OpenAI 兼容上游时，还需要 Magpie 保留所选档位且模型 `serviceTiers` 已声明。当前 Magpie 对自定义地址的 Anthropic 跨协议转发可能丢弃 fast；插件无法恢复到达前已丢弃的字段。客户端不发送参数或宿主丢弃参数时，不会偷偷替用户开启 fast。使用同协议路径或升级具有相应能力的宿主。
+- **Anthropic beta 与权限**：部分模型仍要求 `fast-mode-2026-02-01`，部分新模型已不要求。补兼容头不等于支持该模型或获得加速权限；以站点权限及响应 `usage.speed` 为准。客户端显式发送 `speed: "standard"` 时不会被改成 fast，也不会把 `service_tier: "priority"` 擅自转换成 Anthropic `speed`。
+- **大请求与流式上传**：自动补 beta 的 JSON 检查沿用 1 MiB / 15 秒及取消限制，不消费原始 `Request`；编码后的请求体、超限请求体及 `init.body` 流式上传不检查。此类请求需要客户端自己携带 beta，或在 `protocolHeaders.claude` 中显式配置 `anthropic-beta`。插件不会缓冲响应，fast 的用量、限流头及错误原样返回。
+- **Claude Code 客户端检查**：网关可正常推理不代表 `/fast` 一定可用。Claude Code 可能直接向 Anthropic 检查 fast 权限，或因网关 token 格式而不发检查；遇到这种情况先按[官方网关说明](https://code.claude.com/docs/en/fast-mode#use-fast-mode-behind-proxies-and-llm-gateways)排查。插件无法执行或替代客户端登录/权限检查。Claude Code、omp 或 Magpie 自身也可能降档重试，插件不增加这种行为。
+
+参数依据：[Anthropic fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode)、[Claude Code fast mode](https://code.claude.com/docs/en/fast-mode)、[OpenAI fast mode](https://developers.openai.com/api/docs/guides/fast-mode)、[Magpie provider 插件接口](https://usemagpie.ai/docs/plugins#provider)。
+
 
 ## 查询性能与诊断
 
