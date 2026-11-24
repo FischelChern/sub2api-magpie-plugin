@@ -51,7 +51,7 @@ test("pagination rejects foreign origins, credentials, management paths, cycles 
     await t.test(next, async (t) => {
       const calls = mockAPI(t, () => Response.json({ ...catalog("partial"), next }))
       const plugin = await Sub2apiPlugin()
-      await assert.rejects(plugin.provider.models(previous, { auth: account() }), /pagination/)
+      await assert.rejects(plugin.provider.models(previous, { auth: account() }), /分页/)
       assert.equal(calls.length, 1)
     })
   }
@@ -252,7 +252,7 @@ test("a late successful refresh cannot restore an older catalog", { timeout: 100
   })
   const plugin = await Sub2apiPlugin()
   const loader = await plugin.auth.loader(async () => account())
-  const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), /superseded/)
+  const old = assert.rejects(plugin.provider.models(previous, { auth: account() }), /模型刷新已被新结果取代/)
   await started
   const found = await plugin.provider.models(previous, { auth: account("synthetic-key-a", BASE, { query: { timeoutMs: 1000 } }) })
   assert.deepEqual(Object.keys(found), ["new-model"])
@@ -457,13 +457,13 @@ test("management responses enforce declared, streamed and combined pagination si
         cancel() { cancelled = true },
       }), { headers: declared ? { "content-length": "129" } : {} }))
       const plugin = await Sub2apiPlugin({}, { query: { maxResponseBytes: 128 } })
-      await assert.rejects(plugin.provider.models(previous, { auth: account() }), /size limit/)
+      await assert.rejects(plugin.provider.models(previous, { auth: account() }), /超过大小限制/)
       assert.equal(cancelled, true)
     })
   }
   mockAPI(t, ({ url }) => Response.json(url.includes("after_id") ? catalog("second-long-model-id") : { ...catalog("first-long-model-id"), has_more: true }))
   const plugin = await Sub2apiPlugin({}, { query: { maxResponseBytes: 90 } })
-  await assert.rejects(plugin.provider.models(previous, { auth: account() }), /Combined model catalog/)
+  await assert.rejects(plugin.provider.models(previous, { auth: account() }), /合并后的模型目录超过大小限制/)
 })
 
 test("a stalled management response body is cancelled on timeout", async (t) => {
@@ -472,7 +472,7 @@ test("a stalled management response body is cancelled on timeout", async (t) => 
   const plugin = await Sub2apiPlugin({}, { query: { timeoutMs: 10 } })
   const keepAlive = setTimeout(() => {}, 1000)
   try {
-    await assert.rejects(plugin.provider.models(previous, { auth: account() }), /timed out/)
+    await assert.rejects(plugin.provider.models(previous, { auth: account() }), /Sub2API 接口请求超时/)
     assert.equal(cancelled, true)
   } finally {
     clearTimeout(keepAlive)

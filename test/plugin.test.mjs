@@ -1350,11 +1350,11 @@ test("usage handles balance, quota, expired, unlimited and missing subscriptions
     [{ balance: -1.25 }, (u) => assert.equal(u.balance, "$-1.25")],
     [{ mode: "quota_limited", status: "quota_exhausted", quota: { used: 12, limit: 10 },
       rate_limits: [{ window: "5h", used: 1, limit: 2, reset_at: "2099-01-01T00:00:00Z" }],
-    }, (u) => { assert.equal(u.windows[0].used, 120); assert.equal(u.windows[1].used, 50); assert.match(u.error, /used up/) }],
-    [{ mode: "quota_limited", status: "expired" }, (u) => assert.match(u.error, /expired/)],
+    }, (u) => { assert.equal(u.windows[0].used, 120); assert.equal(u.windows[1].used, 50); assert.match(u.error, /已用尽/) }],
+    [{ mode: "quota_limited", status: "expired" }, (u) => assert.match(u.error, /已过期/)],
     [{ subscription: { daily_limit_usd: 0, weekly_limit_usd: null } }, (u) => { assert.equal(u.balance, "Unlimited"); assert.equal(u.windows.length, 0) }],
-    [{ subscription: { expires_at: "2000-01-01T00:00:00Z" } }, (u) => assert.match(u.error, /expired/)],
-    [{}, (u) => assert.match(u.error, /No active subscription/)],
+    [{ subscription: { expires_at: "2000-01-01T00:00:00Z" } }, (u) => assert.match(u.error, /已过期/)],
+    [{}, (u) => assert.match(u.error, /没有有效订阅/)],
   ]
   for (const [body, check] of cases) {
     await t.test(JSON.stringify(body), async (t) => {
@@ -1362,8 +1362,26 @@ test("usage handles balance, quota, expired, unlimited and missing subscriptions
       check(await plugin.auth.usage(async () => auth()))
     })
   }
-  assert.match((await plugin.auth.usage(async () => undefined)).error, /not signed in/)
-  assert.match((await plugin.auth.usage(async () => ({ type: "api", key: "key" }))).error, /address/)
+  assert.match((await plugin.auth.usage(async () => undefined)).error, /未登录/)
+  assert.match((await plugin.auth.usage(async () => ({ type: "api", key: "key" }))).error, /地址/)
+})
+
+test("usage separates connection failures, timeouts and other errors in Chinese", async (t) => {
+  const account = auth()
+  const cases = [
+    [async () => { throw new TypeError("fetch failed") }, /无法连接 Sub2API 接口/],
+    [async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }) }, /Sub2API 接口请求超时/],
+    [async () => { throw Object.assign(new Error("aborted"), { name: "AbortError" }) }, /Sub2API 接口请求超时/],
+    [async () => new Response("unavailable", { status: 503 }), /Sub2API 接口返回 HTTP 503/],
+    [async () => new Response("not JSON"), /Sub2API 接口响应不是 JSON/],
+  ]
+  for (const [fetchImpl, expected] of cases) {
+    await t.test(String(expected), async (t) => {
+      t.mock.method(globalThis, "fetch", fetchImpl)
+      const plugin = await plugins.Sub2apiPlugin({}, { query: { usageTtlMs: 0 } })
+      assert.match((await plugin.auth.usage(async () => account)).error, expected)
+    })
+  }
 })
 
 test("401 marks sign-in as expired and other model failures propagate without fallback", async (t) => {
@@ -1402,10 +1420,10 @@ test("a transient catalog failure stops blocking inference after its cache TTL",
   } catch (error) {
     catalogError = error
   }
-  assert.equal(catalogError?.message, "Sub2API query failed or timed out")
+  assert.equal(catalogError?.message, "无法连接 Sub2API 接口，请检查站点地址、代理与网络")
   const loader = await plugin.auth.loader(async () => account)
   const request = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-test", input: "hi" }) }
-  await assert.rejects(loader.fetch(BASE + "/v1/responses", request), /Sub2API query failed or timed out/)
+  await assert.rejects(loader.fetch(BASE + "/v1/responses", request), /无法连接 Sub2API 接口/)
   t.mock.timers.setTime(Date.now() + 30_001)
   const response = await loader.fetch(BASE + "/v1/responses", request)
   assert.equal(response.status, 200)
@@ -1421,10 +1439,10 @@ test("manifest failures retain known reasoning levels but malformed model lists 
   assert.deepEqual(models["gpt-test"].variants, previous["gpt-test"].variants)
   t.mock.restoreAll()
   t.mock.method(globalThis, "fetch", async () => json({ data: {} }))
-  await assert.rejects(plugin.provider.models({ models: previous }, { auth: auth() }), /Invalid model catalog/)
+  await assert.rejects(plugin.provider.models({ models: previous }, { auth: auth() }), /模型目录格式无效/)
   t.mock.restoreAll()
   t.mock.method(globalThis, "fetch", async () => new Response("not JSON"))
-  assert.match((await plugin.auth.usage(async () => auth())).error, /not JSON/)
+  assert.match((await plugin.auth.usage(async () => auth())).error, /不是 JSON/)
 })
 
 test("real HTTP sends headers, preserves streaming, cancellation and refuses redirects", async (t) => {

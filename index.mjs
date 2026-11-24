@@ -1050,7 +1050,7 @@ function queryError(message, status, kind) {
 async function responseBytes(res, limit, signal) {
   if (Number(res.headers.get("content-length")) > limit) {
     void res.body?.cancel().catch(() => {})
-    throw queryError("Management response exceeds the size limit", res.status, "size")
+    throw queryError("Sub2API 接口响应超过大小限制", res.status, "size")
   }
   if (!res.body) return Buffer.alloc(0)
   const reader = res.body.getReader()
@@ -1065,7 +1065,7 @@ async function responseBytes(res, limit, signal) {
       signal.throwIfAborted()
       if (done) break
       size += value.byteLength
-      if (size > limit) throw queryError("Management response exceeds the size limit", res.status, "size")
+      if (size > limit) throw queryError("Sub2API 接口响应超过大小限制", res.status, "size")
       chunks.push(Buffer.from(value))
     }
     return Buffer.concat(chunks, size)
@@ -1078,21 +1078,30 @@ async function responseBytes(res, limit, signal) {
 
 async function get(base, path, key, extra = {}, settings = QUERY_DEFAULTS, timeout = settings.timeoutMs) {
   const signal = AbortSignal.timeout(timeout)
-  const res = await fetch(base + path, {
-    headers: { accept: "application/json", ...extra, authorization: `Bearer ${key}` },
-    signal,
-    redirect: "error",
-  })
+  let res
+  try {
+    res = await fetch(base + path, {
+      headers: { accept: "application/json", ...extra, authorization: `Bearer ${key}` },
+      signal,
+      redirect: "error",
+    })
+  } catch (error) {
+    // A failed connection and a deadline are different problems: tell them apart.
+    if (signal.aborted || error?.name === "TimeoutError" || error?.name === "AbortError") {
+      throw queryError("Sub2API 接口请求超时，请检查网络或增大 query.timeoutMs", undefined, "timeout")
+    }
+    throw queryError("无法连接 Sub2API 接口，请检查站点地址、代理与网络", undefined, "network")
+  }
   if (!res.ok) {
     void res.body?.cancel().catch(() => {})
     // Never echo a gateway response: it may contain reflected credentials.
-    throw queryError(`Sub2API query returned HTTP ${res.status}`, res.status, "http")
+    throw queryError(`Sub2API 接口返回 HTTP ${res.status}`, res.status, "http")
   }
   const bytes = await responseBytes(res, settings.maxResponseBytes, signal)
   try {
     return JSON.parse(bytes.toString("utf8"))
   } catch {
-    throw queryError("Sub2API query response is not JSON", res.status, "json")
+    throw queryError("Sub2API 接口响应不是 JSON", res.status, "json")
   }
 }
 
@@ -1111,7 +1120,7 @@ function queries(onExpired) {
     const started = Date.now()
     entry.promise = get(base, path, key, extra, settings, operation === "efforts" ? settings.effortsTimeoutMs : settings.timeoutMs)
       .then((value) => {
-        if (operation === "models" && !Array.isArray(value?.data)) throw queryError("Invalid model catalog", undefined, "catalog")
+        if (operation === "models" && !Array.isArray(value?.data)) throw queryError("模型目录格式无效", undefined, "catalog")
         entry.pending = false
         entry.expires = Date.now() + ttl
         report("query.complete", { operation, elapsedMs: Date.now() - started })
@@ -1123,9 +1132,15 @@ function queries(onExpired) {
           for (const name of cache.keys()) if (name.startsWith(scope + ":")) cache.delete(name)
         } else if (operation === "efforts") entry.expires = Date.now() + 30_000
         else if (cache.get(name) === entry) cache.delete(name)
+        if (!error.kind && !error.signIn) {
+          if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+            error = queryError("Sub2API 接口请求超时，请检查网络或增大 query.timeoutMs", undefined, "timeout")
+          } else {
+            error = queryError("无法连接 Sub2API 接口，请检查站点地址、代理与网络", undefined, "network")
+          }
+        }
         report("query.failed", { operation, status: error.status ?? 0, reason: error.kind ?? "network", elapsedMs: Date.now() - started })
-        if (error.kind || error.signIn) throw error
-        throw queryError("Sub2API query failed or timed out", undefined, "network")
+        throw error
       })
     cacheSet(cache, name, entry)
     return entry.promise
@@ -1229,24 +1244,24 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
   let totalBytes = 0
   let path = "/v1/models"
   for (let page = 0; path; page++) {
-    if (page >= 100 || seen.has(path)) throw queryError("Invalid or excessive model pagination", undefined, "pagination")
+    if (page >= 100 || seen.has(path)) throw queryError("模型分页无效或次数过多", undefined, "pagination")
     seen.add(path)
     const body = await query(base, path, auth.key, extra, settings, report, "models")
-    if (!Array.isArray(body?.data)) throw queryError("Invalid model catalog", undefined, "catalog")
+    if (!Array.isArray(body?.data)) throw queryError("模型目录格式无效", undefined, "catalog")
     totalBytes += Buffer.byteLength(JSON.stringify(body))
-    if (totalBytes > settings.maxResponseBytes) throw queryError("Combined model catalog exceeds the size limit", undefined, "size")
+    if (totalBytes > settings.maxResponseBytes) throw queryError("合并后的模型目录超过大小限制", undefined, "size")
     for (const entry of body.data) entries.push(entry)
     if (typeof body.next === "string" && body.next) {
       const endpoint = new URL(base + "/v1/models")
       let next
-      try { next = new URL(body.next, base + path) } catch { throw queryError("Invalid model pagination URL", undefined, "pagination") }
+      try { next = new URL(body.next, base + path) } catch { throw queryError("模型分页 URL 无效", undefined, "pagination") }
       if (next.origin !== endpoint.origin || next.pathname !== endpoint.pathname || next.username || next.password || next.hash) {
-        throw queryError("Refusing model pagination outside this account's model endpoint", undefined, "pagination")
+        throw queryError("拒绝访问该账号模型端点之外的分页", undefined, "pagination")
       }
       path = "/v1/models" + next.search
     } else if (body.has_more === true) {
       const last = body.last_id ?? body.data.at(-1)?.id
-      if (typeof last !== "string" || !last) throw queryError("Missing model pagination cursor", undefined, "pagination")
+      if (typeof last !== "string" || !last) throw queryError("缺少模型分页游标", undefined, "pagination")
       path = "/v1/models?after_id=" + encodeURIComponent(last)
     } else path = undefined
   }
@@ -1301,8 +1316,8 @@ function fromUsage(u) {
       out.windows.push(win(name, num(r.used) ?? 0, limit, { ...(r.reset_at ? { resetsAt: r.reset_at } : {}), ...(span ? { span } : {}) }))
     }
     if (u.expires_at) out.until = u.expires_at
-    if (u.status === "quota_exhausted") out.error = "The key's quota is used up"
-    else if (u.status === "expired") out.error = "The key has expired"
+    if (u.status === "quota_exhausted") out.error = "密钥额度已用尽"
+    else if (u.status === "expired") out.error = "密钥已过期"
     return out
   }
 
@@ -1331,7 +1346,7 @@ function fromUsage(u) {
     }
     if (s.expires_at) {
       out.until = s.expires_at
-      if (Date.parse(s.expires_at) <= Date.now()) out.error = "The subscription has expired"
+      if (Date.parse(s.expires_at) <= Date.now()) out.error = "订阅已过期"
     }
     if (!out.windows.length) out.balance = "Unlimited"
     return out
@@ -1339,12 +1354,12 @@ function fromUsage(u) {
   if (num(u?.balance) !== undefined) return { plan, balance: money(u.balance) }
   // a subscription group the user has no subscription to (or one gone):
   // the gateway lets the request through to fail, and tells no usage
-  return { plan, error: "No active subscription for this key's group", windows: [] }
+  return { plan, error: "该密钥的分组没有有效订阅", windows: [] }
 }
 
 async function usage(client, id, auth, base, extra, query, settings, report) {
-  if (auth?.type !== "api" || !auth.key) return { error: "not signed in" }
-  if (!base) return { error: "No sub2api address saved with this key; sign in again" }
+  if (auth?.type !== "api" || !auth.key) return { error: "未登录" }
+  if (!base) return { error: "该密钥没有保存 Sub2API 地址，请重新登录" }
   await named(client, id, auth, base)
   const user = label(auth, base)
   try {
@@ -1569,7 +1584,7 @@ function hooks(client, id, site, options) {
           const currentAuth = authStates.get(scope)
           if (currentAuth?.error && currentAuth.error !== authAtStart?.error) throw currentAuth.error
           if (currentAuth && currentAuth !== authAtStart && catalogs.get(catalogKey) !== catalog) {
-            throw queryError("Sub2API model refresh was superseded", undefined, "superseded")
+            throw queryError("模型刷新已被新结果取代，请重试", undefined, "superseded")
           }
           if (catalogs.get(catalogKey) === catalog) {
             cacheSet(authStates, scope, { error: currentAuth?.error, expired: false })
