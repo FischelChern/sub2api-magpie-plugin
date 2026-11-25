@@ -245,7 +245,7 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 每次登录一个 API key，Magpie 为其保存独立账号。插件在该账号作用域内使用该 key 查询 `/v1/models`，默认保留全部有效模型 ID，不因名称陌生、厂商、视觉能力或是否为对话模型而自动删除。非对话模型也能被列出，但不代表本插件实现了对应的图片生成、嵌入等发送接口。
 
 - 支持标准 `data` 列表、`has_more` / `last_id` 游标分页，以及 `next` URL 分页。分页只允许访问同一账号的 `/v1/models`，保留部署前缀；最多 100 页，合计 JSON 内容受体积上限约束，超限或任一页失败直接报错，不返回截断列表。
-- key A 和 key B 的模型独立交给 Magpie。只有 A 列出的模型由 A 的发送函数调用；只有 B 列出的模型由 B 调用。两者都有的同名模型由 Magpie 的账号路由选择，选定后使用该账号自己的 URL、key 和请求头，不把模型静态绑定到最后登录的 key，也不把 key 放进模型对象。
+- 每个 key 的模型清单独立交给 Magpie，包含该 key 上游列出的模型和适用于它的 `forceModels` 配置。多个账号都列出同一模型时，由 Magpie 选择账号，使用该账号自己的 URL、key 和请求头。模型对象不含 key。
 - 多 key 可以属于不同站点，也可以属于同一站点的不同分组。查询缓存按地址、key 和合并后的请求头隔离，仅进程内保存摘要索引，不持久化密钥。
 - 模型刷新保留 Magpie 已知的上下文、输出限制、价格、能力、选项和模型请求头；重新确定当前账号的 API 地址、模型 ID 和 SDK。未知价格不再填成零，未知视觉或推理能力不直接按协议判定。
 - 模型查询失败直接抛出错误，不返回宿主默认列表、其他账号列表或过期列表作为成功刷新。普通目录错误会短暂阻断该账号已有发送函数：成功刷新可立即恢复，否则错误在 30 秒后解除；到期只清除错误，保留最近成功目录的模型 ID 和档位（若存在），继续进行模型核对和旧速度 ID 归一化，不重新查询或返回旧目录。首次查询尚未成功时没有这些目录元数据。401 登录失效不会随这 30 秒自动解除，必须由失效后新启动的成功模型刷新恢复；较早的在途刷新不能覆盖较新的目录或清除较新的登录失效状态。不为模型核对消费流式上传。
@@ -273,17 +273,38 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 }
 ```
 
-数值仅为配置示例，须按站点实际能力和计价填写。覆盖项只应用于 key 本来就能查询到的模型，不会凭空添加权限。全局 < 站点 < 账号元数据；筛选数组逐层替换，名称逐 ID 合并，覆盖元数据深度合并。可覆盖 `name`、`limit`、`cost`、`capabilities`、`options`、`headers`、`variants`、`release_date`、`status` 和 `serviceTiers`，但不能改模型身份、API 地址或账号凭据。`serviceTiers` 数组逐层替换。额外模型请求头仍接受保留头校验。显式协议继续使用 `modelProtocols`。
+数值仅为配置示例，须按站点实际能力和计价填写。覆盖项应用于上游列出或通过 `forceModels` 补录的模型。全局 < 站点 < 账号元数据，筛选数组逐层替换，名称逐 ID 合并，覆盖元数据深度合并。可覆盖 `name`、`limit`、`cost`、`capabilities`、`options`、`headers`、`variants`、`release_date`、`status` 和 `serviceTiers`。`serviceTiers` 数组逐层替换。账号凭据和 API 地址仍由所选账号决定，协议可用 `modelProtocols` 指定。
+
+### 补录模型和设置兼容默认值
+
+```json
+{
+  "forceModels": ["gpt-6.2-astra"],
+  "defaultReasoningEfforts": ["low", "medium", "high", "xhigh"],
+  "defaultServiceTiers": ["priority"],
+  "modelOverrides": {
+    "gpt-6.2-astra": {
+      "variants": {"low": {}, "medium": {}, "high": {}, "xhigh": {}},
+      "serviceTiers": ["priority", "ultrafast"]
+    }
+  }
+}
+```
+
+- `forceModels` 在模型目录成功刷新后补录精确的上游 ID。上游已列出的条目保留原元数据，`includeModels` 和 `excludeModels` 仍参与筛选。补录的模型使用当前账号的凭据转发，上游照常校验权限并返回自己的响应。
+- `defaultReasoningEfforts` 用于已识别的推理模型，在主清单与辅助 manifest 都没有有效等级时优先于宿主已有等级。省略该配置项时沿用原回退规则，显式空数组代表回退时公布零个等级。
+- `defaultServiceTiers` 用于 Responses 和 Chat Completions，在主清单与 manifest 都缺少该字段时生效。上游显式空数组仍代表零个层级。服务层级配置声明可选能力，实际请求速度由客户端或网关选择。
+- 三个数组都支持全局、`sites[]` 和账号 `metadata` 配置，优先级从低到高，逐层替换。逐模型 `modelOverrides` 的档位声明优先于上游和兼容默认值。只需补录单个模型时，可省略两个默认值，避免影响站点中其他模型。保存后重新拉取模型。
 
 ### 在原模型上选择 Fast / Ultraspeed
 
 能力读取不限定模型家族：Claude、Gemini、DeepSeek、Qwen 和自定义别名均读取主列表报告的思考等级。主列表只报告 `reasoning: true` 或 `capabilities.reasoning: true` 而未提供等级时，使用默认思考等级；没有能力声明的未知模型不强行标记为思考模型。快速服务档位同样逐模型读取，但只有使用 OpenAI 兼容协议时才声明 `serviceTiers`，不把 Anthropic/Gemini 原生速度参数混用为 OpenAI 服务档位。
 
-思考等级优先采用主列表的 `supported_reasoning_levels`（字符串或 `{ "effort": "high" }` 数组），其次采用辅助 Codex manifest，然后保留宿主已有等级；都没有时，GPT-5 及后续数字代际、o 系列和其他已识别思考模型默认使用 `low` / `medium` / `high`。`modelOverrides` 仍可显式覆盖。默认等级只是兼容回退，不代表站点已验证支持；不会自动添加 `xhigh`。
+思考等级依次采用逐模型 `modelOverrides`、主列表的 `supported_reasoning_levels`（字符串或 `{ "effort": "high" }` 数组）、辅助 Codex manifest、已配置的 `defaultReasoningEfforts`、宿主已有等级。都没有时，GPT-5 及后续数字代际、o 系列和其他已识别思考模型使用内置的 `low` / `medium` / `high`。
 
-若 Codex 没有显示思考等级或 `/fast`，请先更新 Magpie、重载插件并重新同步客户端模型目录，再重启 Codex。使用 `model_catalog_json` 时应检查该 JSON 中对应模型的 `supported_reasoning_levels` 和 `service_tiers`；只刷新网关模型列表未必会更新客户端正在读取的文件。快速档位来源均缺失时保持不展示；确认上游权限后可按下文显式配置，不会发送收费探测请求。
+若 Codex 没有显示思考等级或 `/fast`，请先更新 Magpie、重载插件并重新同步客户端模型目录，再重启 Codex。使用 `model_catalog_json` 时，检查该文件中对应模型的 `supported_reasoning_levels` 和 `service_tiers`。确认上游支持后，可通过兼容默认值或逐模型覆盖声明档位。
 
-模型列表只保留站点返回的真实 ID。插件把当前 key 报告的服务档位写入原模型的 `serviceTiers`，由 Magpie 提供给支持速度选择的 Agent（例如支持服务档位目录的 Codex）。不生成 `-fast` / `-ultraspeed` 模型，不更改原模型的 ID、思考等级或默认速度。显示名末尾的 `(fast)` / `（fast）`、`(ultraspeed)`、`(ultrafast)` 等速度标签会移除（包括站点、宿主缓存和自定义名称）；真实 ID 本身不清理，速度能力仅通过参数元数据声明，不根据标签推断支持。
+插件把当前 key 的服务档位写入原模型的 `serviceTiers`，由 Magpie 提供给支持速度选择的 Agent（例如支持服务档位目录的 Codex）。Fast 和 Ultraspeed 共用原模型 ID。显示名末尾的 `(fast)` / `（fast）`、`(ultraspeed)`、`(ultrafast)` 等速度标签会移除（包括站点、宿主缓存和自定义名称），实际模型 ID 保持原样。
 
 | Agent 选择 | OpenAI 兼容请求参数 | 发给上游的模型 ID |
 | --- | --- | --- |
@@ -299,7 +320,7 @@ Magpie 的账号级 `baseURL` 优先于模型地址，因此发送函数还会�
 
 Magpie 选择账号后，上游收到的 `model` 是 `gpt-example`，速度参数保持 `priority`。`ultraspeed` 是配置别名，线上参数使用 `ultrafast`，不是 `service_tier: "ultraspeed"`。
 
-- **仅报告有依据的能力**：优先读取当前 key 的 `/v1/models` 中的 `service_tiers` / `serviceTiers`，支持字符串或 `{ "id": "priority" }` 数组。含 Responses 模型时，缺失字段可由同一 key 的 `/backend-api/codex/models` 补充。主列表明确返回空数组、`null` 或无效值时，不从辅助 manifest 补回权限。
+- 逐模型覆盖优先。发现服务层级时，先读取当前 key 的 `/v1/models` 中的 `service_tiers` / `serviceTiers`，支持字符串或 `{ "id": "priority" }` 数组。含 Responses 模型时，缺失字段可由同一 key 的 `/backend-api/codex/models` 补充。主列表明确返回空数组、`null` 或无效值时，视为零个服务层级。
 - 没有速度元数据时，不按 GPT 名称、套餐名、协议或其他 key 的模型信息推断支持，也不发起收费探测。可选 manifest 的非 401 失败不隐藏原模型，但不会把上次的速度能力当成一次成功刷新的当前结果；401 仍作为登录失效处理。能力展示是否准确仍取决于站点报告，不能替代上游权限校验。
 - 站点未报告、但你已确认某个 key 支持时，可以为原模型显式声明。以下配置也可放在站点选项或账号 `metadata` 中；同名模型在不同 key 上权限不同时，优先账号级配置：
 
