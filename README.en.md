@@ -10,9 +10,9 @@ Project source: `sub2api magpie`. This project is refactored from that provider 
 
 Capability discovery is not restricted to model families: Claude, Gemini, DeepSeek, Qwen and custom aliases all read primary-list reasoning levels. A primary entry with `reasoning: true` or `capabilities.reasoning: true` but no levels receives default efforts. Unknown models without capability evidence are not forced into reasoning mode. Speed tiers are also read per model, but `serviceTiers` are advertised only for OpenAI-compatible protocols; native Anthropic/Gemini speed parameters are not treated as OpenAI service tiers.
 
-Model discovery automatically reads reasoning levels and speed tiers from `GET /v1/models`. Catalogs containing Responses models also query `GET /backend-api/codex/models` with the same key to supplement missing metadata; no extra switch is needed. Primary `supported_reasoning_levels` (strings or objects such as `{ "effort": "high" }`) take precedence over the manifest, then existing host levels. Without those, GPT-5 and later numeric generations, o-series and other recognized reasoning models fall back to `low` / `medium` / `high`. These defaults are not verified upstream capabilities and do not automatically include `xhigh`. Explicit `modelOverrides` still take precedence. Missing speed eligibility is never guessed or tested with billable requests.
+Model discovery reads reasoning levels and speed tiers from `GET /v1/models`. Catalogs containing Responses models also query `GET /backend-api/codex/models` with the same key. Reasoning levels come from per-model `modelOverrides`, primary `supported_reasoning_levels` (strings or objects such as `{ "effort": "high" }`), the manifest, configured `defaultReasoningEfforts`, then existing host levels, in that order. GPT-5 and later numeric generations, o-series and other recognized reasoning models otherwise use the built-in `low` / `medium` / `high` fallback.
 
-If Codex shows neither reasoning levels nor `/fast`, update Magpie, reload the plugin, resynchronize the client model catalog and restart Codex. When using `model_catalog_json`, inspect that file's `supported_reasoning_levels` and `service_tiers` for the selected model: refreshing the gateway alone may not refresh the file the client reads. If the site reports no speed metadata, configure `modelOverrides.<id>.serviceTiers` only after confirming upstream eligibility, as described below.
+If Codex shows neither reasoning levels nor `/fast`, update Magpie, reload the plugin, resynchronize the client model catalog and restart Codex. When using `model_catalog_json`, check that file's `supported_reasoning_levels` and `service_tiers` for the selected model. After confirming upstream support, you can declare capabilities through the configured defaults or per-model overrides.
 
 From this project directory:
 
@@ -157,7 +157,7 @@ The loader's base URL overrides per-model URLs in Magpie; the account fetch func
 Every API-key sign-in is a separate account. Its `/v1/models` request uses that account's key and returns all valid model IDs by default, including unfamiliar names, namespaced IDs and non-chat models. Listing an image or embedding model does not implement its non-conversational API.
 
 - Supports `data` lists, `has_more` / `last_id` cursor pagination and `next` URLs. Every page stays on this account's exact `/v1/models` endpoint, including the deployment prefix. More than 100 pages, excessive combined JSON size, cycles, unsafe URLs or a failed page produce an error, never a truncated catalog.
-- Magpie receives each account's own model list. A model listed only by A uses A's transport; one listed only by B uses B's. For shared model IDs, Magpie chooses an eligible account, then uses that account's Base URL, key and headers. Keys are not embedded in model objects or bound globally to the last account loaded.
+- Magpie receives each account's own model list, based on the upstream IDs and the `forceModels` configuration for that account. For shared IDs, Magpie chooses an eligible account and uses its Base URL, key and headers. Model objects contain no keys.
 - Keys may belong to different sites or different groups on one site. In-memory query caches use digests of the address, key and merged headers, without persisting credentials.
 - Refreshes preserve known context/output limits, prices, capabilities, options and model headers, while rebuilding the current account's model identity, SDK and API address. Unknown prices are omitted instead of set to zero; protocol alone does not determine vision or reasoning support.
 - Failed discovery throws; it never returns host defaults, another account's list or an old catalog as a successful refresh. An ordinary catalog error blocks an existing account transport for at most 30 seconds unless a successful refresh restores it sooner. Expiry clears only that error, retaining IDs and tiers from the last successful catalog, when available, for model checks and legacy speed-ID normalization; it neither requeries nor returns an old catalog. No catalog metadata exists before the first successful discovery. A 401 remains blocking until a successful model refresh started after that invalidation; older in-flight refreshes cannot overwrite a newer catalog or clear newer sign-in expiry. Streaming uploads are not consumed for model checks.
@@ -185,11 +185,32 @@ Without filters, every real key model remains visible, without additional speed 
 }
 ```
 
-Values are illustrative: use your site's actual capabilities and prices. Overrides apply only to models already returned for the key; they do not create permissions. Precedence is global < site < account metadata. Filter arrays replace earlier arrays, names merge per ID, and metadata overrides merge deeply. Allowed fields are `name`, `limit`, `cost`, `capabilities`, `options`, `headers`, `variants`, `release_date`, `status` and `serviceTiers`, not model identity, API routing or credentials. `serviceTiers` arrays replace earlier arrays. Model headers obey reserved-header validation. Continue using `modelProtocols` for protocol overrides.
+Use your site's actual capabilities and prices. Overrides apply to upstream models and IDs added through `forceModels`. Precedence is global < site < account metadata. Filter arrays replace earlier arrays, names merge per ID, and metadata overrides merge deeply. Allowed fields are `name`, `limit`, `cost`, `capabilities`, `options`, `headers`, `variants`, `release_date`, `status` and `serviceTiers`. `serviceTiers` arrays replace earlier arrays. The selected account supplies its credentials and API URL. Use `modelProtocols` to specify a protocol.
+
+### Add model IDs and configure capability defaults
+
+```json
+{
+  "forceModels": ["gpt-6.2-astra"],
+  "defaultReasoningEfforts": ["low", "medium", "high", "xhigh"],
+  "defaultServiceTiers": ["priority"],
+  "modelOverrides": {
+    "gpt-6.2-astra": {
+      "variants": {"low": {}, "medium": {}, "high": {}, "xhigh": {}},
+      "serviceTiers": ["priority", "ultrafast"]
+    }
+  }
+}
+```
+
+- `forceModels` adds exact upstream IDs after a successful catalog refresh. Existing entries keep their upstream metadata. `includeModels` and `excludeModels` still apply. Requests use the selected account's own credentials, and the upstream still enforces its permissions.
+- `defaultReasoningEfforts` applies to recognized reasoning models when neither discovery endpoint supplies usable levels. It takes precedence over existing host levels. Omit the option for the original fallback behavior, or use an empty array to advertise zero levels as the fallback.
+- `defaultServiceTiers` applies to Responses and Chat Completions when neither discovery endpoint supplies the field. An explicit upstream empty array still advertises zero tiers. This option advertises capabilities so the client or gateway can select a speed.
+- The three arrays can be set globally, in a `sites[]` entry, or in account `metadata`. Each layer replaces the preceding array. Per-model `modelOverrides` take precedence over discovery and defaults. Omit both defaults to target just one model. Refresh the model catalog after saving the options.
 
 ### Select Fast / Ultraspeed On The Original Model
 
-The catalog contains only real IDs returned by the site. Supported service tiers reported for the current key are attached to each original model as `serviceTiers`. Magpie can offer them to agents that understand tier catalogs, such as compatible Codex versions. No `-fast` / `-ultraspeed` models are generated, and model IDs, reasoning levels and default speeds stay unchanged. Trailing `(fast)`, `(ultraspeed)` and `(ultrafast)` display labels, including fullwidth parentheses, are removed from site, host-cached and custom names. Real IDs are never cleaned. Speed capabilities are declared only through parameter metadata, never inferred from name labels.
+Service tiers for the current key are attached to each original model as `serviceTiers`. Magpie can offer them to agents that understand tier catalogs, such as compatible Codex versions. Fast and Ultraspeed share the original model ID. Trailing `(fast)`, `(ultraspeed)` and `(ultrafast)` display labels, including fullwidth parentheses, are removed from site, host-cached and custom names. The actual IDs are preserved.
 
 | Agent selection | OpenAI-compatible request parameter | Upstream model ID |
 | --- | --- | --- |
@@ -205,7 +226,7 @@ For example, an agent selects Fast while calling `sub2api/gpt-example` through M
 
 After Magpie selects an account, the upstream model is `gpt-example`, with `priority` unchanged. `ultraspeed` is a configuration alias: the wire value is `ultrafast`, not `service_tier: "ultraspeed"`.
 
-- **Only evidence-backed capabilities are advertised.** The current key's `/v1/models` supplies `service_tiers` / `serviceTiers`, accepting strings or objects such as `{ "id": "priority" }`. For catalogs containing Responses models, absent fields can be supplemented by the same key's `/backend-api/codex/models`. An explicit empty array, `null` or malformed primary value is not filled back in from the optional manifest.
+- Per-model overrides take precedence. Discovery first checks the current key's `/v1/models` for `service_tiers` / `serviceTiers`, accepting strings or objects such as `{ "id": "priority" }`. For catalogs containing Responses models, absent fields can be supplemented by the same key's `/backend-api/codex/models`. An explicit empty array, `null` or malformed primary value represents zero tiers.
 - Missing speed metadata is not inferred from a GPT name, subscription label, protocol or another key's host metadata. No billable capability probes are sent. An unavailable optional manifest does not hide the model, but its previous tiers are not reused as current capabilities. Site-reported capabilities still cannot replace upstream authorization checks.
 - If metadata is missing but you have verified a key's support, declare it explicitly on the original model. This configuration also works in site options or account `metadata`; prefer account-level overrides when keys have different eligibility for the same model:
 

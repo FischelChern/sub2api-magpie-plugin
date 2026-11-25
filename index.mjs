@@ -517,7 +517,11 @@ function mergeModel(...values) {
 }
 
 function modelSettings(...layers) {
-  const out = { includeModels: undefined, excludeModels: [], modelNames: {}, modelOverrides: {}, speedModels: undefined }
+  const out = {
+    includeModels: undefined, excludeModels: [], forceModels: [],
+    defaultReasoningEfforts: undefined, defaultServiceTiers: undefined,
+    modelNames: {}, modelOverrides: {}, speedModels: undefined,
+  }
   for (const layer of layers) {
     if (!layer) continue
     if (layer.speedModels !== undefined) {
@@ -536,10 +540,21 @@ function modelSettings(...layers) {
         out.speedModels = next
       }
     }
-    for (const field of ["includeModels", "excludeModels"]) {
+    for (const field of ["includeModels", "excludeModels", "forceModels"]) {
       if (layer[field] === undefined) continue
       if (!Array.isArray(layer[field]) || layer[field].some((id) => typeof id !== "string" || !id)) throw new Error(`${field} must be an array of model IDs`)
       out[field] = [...layer[field]]
+    }
+    if (out.forceModels.some((id) => /\s/.test(id) || ["__proto__", "constructor", "prototype"].includes(id))) {
+      throw new Error("forceModels requires exact model IDs")
+    }
+    for (const field of ["defaultReasoningEfforts", "defaultServiceTiers"]) {
+      const ids = layer[field]
+      if (ids === undefined) continue
+      if (!Array.isArray(ids) || ids.length > 64 || ids.some((id) => typeof id !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/.test(id) || ["constructor", "prototype"].includes(id))) {
+        throw new Error(`${field} must be an array of valid IDs`)
+      }
+      out[field] = [...new Set(ids)]
     }
     for (const field of ["modelNames", "modelOverrides"]) {
       if (layer[field] === undefined) continue
@@ -606,7 +621,7 @@ function modelServiceTiers(model, manifest, selection, protocol) {
   const legacy = selection.speedModels
   const legacyConfigured = legacy && !Array.isArray(legacy) && Object.hasOwn(legacy, model.id)
   const declared = configured ?? (legacyConfigured ? legacy[model.id] : undefined)
-  let tiers = serviceTiers(declared ?? reportedTiers(model) ?? manifest?.serviceTiers)
+  let tiers = serviceTiers(declared ?? reportedTiers(model) ?? manifest?.serviceTiers ?? selection.defaultServiceTiers)
   // Native service_tier selection is supported on OpenAI-compatible APIs.
   // Never borrow account eligibility from the host's merged model metadata.
   if (!["responses", "chat-completions"].includes(protocol)) {
@@ -1173,12 +1188,13 @@ function modelDisplayName(name, id) {
 
 // runtimeModel is magpie's model. Its variants are its reasoning levels
 // (magpie offers a thinking model's variants' keys as its efforts), the
-// first of: the primary/manifest levels the site tells (told), the variants magpie already
-// has for the model (was: models.dev's, the config's), LEVELS when the
-// model thinks.
-function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
+// Without a per-model override, prefer upstream levels, then configured
+// defaults for reasoning models, then host variants or the built-in levels.
+function runtimeModel(m, url, providerID, told, was, npm, override = {}, defaultEfforts) {
   const kept = was?.variants && typeof was.variants === "object" && Object.keys(was.variants).length ? was.variants : undefined
-  const reasoning = m.reasoning === true || !!told?.length || !!kept || /think|reason|(?:^|\/)(?:o\d|gpt-(?:[5-9]|[1-9]\d+)(?:[.-]|$)|codex-)/i.test(m.id)
+  const reasoning = m.reasoning === true || !!told?.length || !!kept
+    || Object.keys(override.variants ?? {}).length > 0
+    || /think|reason|(?:^|\/)(?:o\d|gpt-(?:[5-9]|[1-9]\d+)(?:[.-]|$)|codex-)/i.test(m.id)
   const defaults = {
     id: m.id,
     providerID,
@@ -1208,8 +1224,9 @@ function runtimeModel(m, url, providerID, told, was, npm, override = {}) {
   for (const header of LEGACY_SPEED_HEADERS) delete out.headers[header]
   delete out.fast
   out.name = override.name ?? (m.named ? m.name : was?.name ?? m.name)
-  if (told?.length && override.variants === undefined) out.variants = variantsOf(told)
   if (override.variants !== undefined) out.variants = mergeModel(override.variants)
+  else if (told?.length) out.variants = variantsOf(told)
+  else if (reasoning && defaultEfforts !== undefined) out.variants = variantsOf(defaultEfforts)
   if (override.capabilities?.reasoning === undefined && reasoning) out.capabilities.reasoning = true
   return out
 }
@@ -1235,9 +1252,7 @@ async function codexModels(query, base, key, extra, settings, report) {
   return out
 }
 
-// models is what GET /v1/models lists for the key: its group's, in
-// Anthropic's shape or OpenAI's as the group's platform has it; was is the
-// models magpie already has.
+// Build the account's catalog from its upstream list and explicitly configured IDs.
 async function models(id, base, auth, was, extra, routing, settings, selection, query, report) {
   const entries = []
   const seen = new Set()
@@ -1265,6 +1280,13 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
       path = "/v1/models?after_id=" + encodeURIComponent(last)
     } else path = undefined
   }
+  const discovered = entries.length
+  const listed = new Set(entries.map((entry) => entry?.id))
+  for (const id of selection.forceModels) {
+    if (listed.has(id)) continue
+    entries.push({ id })
+    listed.add(id)
+  }
   const told = entries.some((m) => typeof m?.id === "string" && modelProtocol(m.id, routing) === "responses")
     ? await codexModels(query, base, auth.key, extra, settings, report) : {}
   const out = Object.create(null)
@@ -1275,11 +1297,15 @@ async function models(id, base, auth, was, extra, routing, settings, selection, 
     const named = typeof display === "string" && !!display
     const name = named ? display : m.id
     const protocol = modelProtocol(m.id, routing)
-    out[m.id] = runtimeModel({ id: m.id, name, named, reasoning: m.reasoning === true || m.capabilities?.reasoning === true }, base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, reasoningLevels(m) ?? told[m.id]?.levels, was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id])
+    out[m.id] = runtimeModel(
+      { id: m.id, name, named, reasoning: m.reasoning === true || m.capabilities?.reasoning === true },
+      base + routing.apiPaths[protocol].replace(/\/+$/, ""), id, reasoningLevels(m) ?? told[m.id]?.levels,
+      was?.[m.id], PROTOCOLS[protocol], selection.modelOverrides[m.id], selection.defaultReasoningEfforts,
+    )
     out[m.id].name = modelDisplayName(selection.modelNames[m.id] ?? out[m.id].name, m.id)
     out[m.id].serviceTiers = modelServiceTiers(m, told[m.id], selection, protocol)
   }
-  report("models.ready", { discovered: entries.length, visible: Object.keys(out).length })
+  report("models.ready", { discovered, visible: Object.keys(out).length })
   return out
 }
 

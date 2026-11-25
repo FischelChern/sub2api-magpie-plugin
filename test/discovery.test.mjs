@@ -68,6 +68,78 @@ test("a genuinely empty key catalog stays empty without inheriting host models",
   assert.deepEqual(await plugin.provider.models(previous), {})
 })
 
+test("forced IDs are listed and forwarded on each configured key using its own credentials", async (t) => {
+  const model = "gpt-6.2-astra"
+  const denied = Response.json({ error: "upstream denied this model" }, { status: 403 })
+  const calls = mockAPI(t, ({ url, headers }) => {
+    if (url.endsWith("/v1/models")) {
+      return Response.json(headers.get("authorization") === "Bearer listed"
+        ? { data: [{ id: model, display_name: "Upstream Astro" }] } : catalog("other"))
+    }
+    if (url.endsWith("/backend-api/codex/models")) return Response.json({ models: [] })
+    return headers.get("authorization") === "Bearer listed" ? Response.json({ ok: true }) : denied
+  })
+  const plugin = await Sub2apiSite1({}, {
+    sites: [{ id: "site", url: BASE, forceModels: [model, model, "filtered"], excludeModels: ["filtered"], modelOverrides: {
+      [model]: { variants: { xhigh: {} }, serviceTiers: ["priority"] },
+    } }],
+  })
+  const listed = account("listed")
+  const unlisted = account("unlisted")
+  const optedOut = account("opted-out", BASE, { forceModels: [] })
+  const [first, second, third] = await Promise.all([listed, unlisted, optedOut].map((auth) => plugin.provider.models(previous, { auth })))
+  assert.deepEqual(Object.keys(first), [model])
+  assert.equal(first[model].name, "Upstream Astro")
+  assert.deepEqual(Object.keys(second), ["other", model])
+  assert.deepEqual(Object.keys(second[model].variants), ["xhigh"])
+  assert.deepEqual(second[model].serviceTiers, ["priority"])
+  assert.deepEqual(Object.keys(third), ["other"])
+
+  const body = JSON.stringify({ model, reasoning: { effort: "xhigh" }, service_tier: "priority" })
+  for (const auth of [listed, unlisted, optedOut]) {
+    const loader = await plugin.auth.loader(async () => auth)
+    const send = () => loader.fetch(BASE + "/v1/responses", { method: "POST", body })
+    if (auth === optedOut) await assert.rejects(send(), /not listed/)
+    else {
+      const response = await send()
+      if (auth === unlisted) assert.equal(response, denied)
+      else assert.equal(response.status, 200)
+    }
+  }
+  const forwarded = calls.filter(({ url }) => url.endsWith("/v1/responses"))
+  assert.deepEqual(forwarded.map(({ headers, init }) => [headers.get("authorization"), init.body]), [
+    ["Bearer listed", body], ["Bearer unlisted", body],
+  ])
+})
+
+test("capability defaults fill missing metadata and respect explicit upstream and model overrides", async (t) => {
+  mockAPI(t, ({ url }) => Response.json(url.endsWith("/backend-api/codex/models") ? { models: [
+    { slug: "gpt-primary", supported_reasoning_levels: ["max"], service_tiers: ["ultrafast"] },
+    { slug: "gpt-manifest", supported_reasoning_levels: ["high"], service_tiers: [] },
+  ] } : { data: [
+    { id: "gpt-primary", supported_reasoning_levels: ["medium"], service_tiers: [] },
+    { id: "gpt-manifest" }, { id: "gpt-default" }, { id: "custom" }, { id: "claude-native" },
+  ] }))
+  const plugin = await Sub2apiPlugin({}, {
+    defaultReasoningEfforts: ["medium", "xhigh"],
+    defaultServiceTiers: ["fast"],
+    modelOverrides: { custom: { variants: { max: {} }, serviceTiers: [] } },
+  })
+  const found = await plugin.provider.models({ models: { "gpt-default": { variants: { high: {} } } } }, { auth: account() })
+  const capabilities = (id) => [Object.keys(found[id].variants), found[id].serviceTiers]
+  assert.deepEqual(capabilities("gpt-primary"), [["medium"], []])
+  assert.deepEqual(capabilities("gpt-manifest"), [["high"], []])
+  assert.deepEqual(capabilities("gpt-default"), [["medium", "xhigh"], ["priority"]])
+  assert.deepEqual(capabilities("custom"), [["max"], []])
+  assert.equal(found.custom.capabilities.reasoning, true)
+  assert.deepEqual(capabilities("claude-native"), [[], []])
+  const disabled = await plugin.provider.models(previous, { auth: account("disabled", BASE, {
+    defaultReasoningEfforts: [], defaultServiceTiers: [],
+  }) })
+  assert.deepEqual(disabled["gpt-default"].variants, {})
+  assert.deepEqual(disabled["gpt-default"].serviceTiers, [])
+})
+
 test("model refresh preserves known metadata without mutating the host or borrowing API identity", async (t) => {
   mockAPI(t, () => Response.json(catalog("vision-chat", "gpt-legacy")))
   const known = {
@@ -115,6 +187,7 @@ test("optional exact filters, display names and model overrides merge global < s
 test("invalid model and query settings fail explicitly without exposing their values", async () => {
   const bad = [
     { includeModels: "private" }, { excludeModels: [42] }, { modelNames: { a: 1 } },
+    { forceModels: ["secret model"] }, { defaultReasoningEfforts: "secret" }, { defaultServiceTiers: ["secret tier"] },
     { modelOverrides: { a: { api: { url: "secret" } } } },
     { modelOverrides: { a: { options: { apiKey: "secret" } } } },
     { modelOverrides: { a: { limit: { context: -1 } } } },
